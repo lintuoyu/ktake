@@ -101,6 +101,8 @@ struct GarageBandStems {
 }
 
 enum GarageBandProject {
+    static let templateURL = Bundle.main.url(forResource: "GarageBandTemplate", withExtension: "band")
+
     static func export(_ request: GarageBandExportRequest, selected: Set<UUID>, to parent: URL) async throws -> URL {
         let job = Task.detached(priority: .userInitiated) {
             try await render(request, selected: selected, parent: parent)
@@ -120,8 +122,8 @@ enum GarageBandProject {
         guard let source = request.backingURL, files.fileExists(atPath: source.path) else {
             throw AppFailure(message: "找不到录唱时使用的伴奏。")
         }
-        guard let template = Bundle.main.url(forResource: "GarageBandTemplate", withExtension: "band") else {
-            throw AppFailure(message: "缺少 GarageBand 工程模板，请重新安装 KTake。")
+        guard let template = templateURL else {
+            throw AppFailure(message: "此版本未附带 GarageBand 工程模板，请导出分轨 WAV。")
         }
         let backing = request.anchor.accompanimentPath == nil ? source :
             try await PitchRenderer.prepare(source: source, semitones: request.pitch)

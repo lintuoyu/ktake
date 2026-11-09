@@ -2,3 +2,9 @@
 dist/
 .DS_Store
 .swiftpm/
+/Library/
+/Resources/
+/Tests/
+/Tools/
+/scripts/render-icon.sh
+/scripts/test-*.sh

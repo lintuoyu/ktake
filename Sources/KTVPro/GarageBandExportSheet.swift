@@ -9,7 +9,7 @@ struct GarageBandExportSheet: View {
 
     let request: GarageBandExportRequest
     @Environment(\.dismiss) private var dismiss
-    @State private var format: ExportFormat = .project
+    @State private var format: ExportFormat
     @State private var selected: Set<UUID>
     @State private var task: Task<Void, Never>?
     @State private var resultURL: URL?
@@ -18,6 +18,7 @@ struct GarageBandExportSheet: View {
 
     init(request: GarageBandExportRequest) {
         self.request = request
+        _format = State(initialValue: GarageBandProject.templateURL == nil ? .stems : .project)
         _selected = State(initialValue: [request.anchor.id])
     }
 
@@ -68,16 +69,18 @@ struct GarageBandExportSheet: View {
                     Button("完成") { dismiss() }.keyboardShortcut(.defaultAction)
                 }
             } else {
-                Picker("导出格式", selection: $format) {
-                    Text("GarageBand工程（伴奏+1条人声）").tag(ExportFormat.project)
-                    Text("分轨WAV（多条人声）").tag(ExportFormat.stems)
-                }
-                .disabled(task != nil)
-                .onChange(of: format) { _, newFormat in
-                    guard newFormat == .project else { return }
-                    let retained = takes.first { $0.id == request.anchor.id && selected.contains($0.id) }
-                        ?? takes.first { selected.contains($0.id) }
-                    selected = retained.map { Set([$0.id]) } ?? []
+                if GarageBandProject.templateURL != nil {
+                    Picker("导出格式", selection: $format) {
+                        Text("GarageBand工程（伴奏+1条人声）").tag(ExportFormat.project)
+                        Text("分轨WAV（多条人声）").tag(ExportFormat.stems)
+                    }
+                    .disabled(task != nil)
+                    .onChange(of: format) { _, newFormat in
+                        guard newFormat == .project else { return }
+                        let retained = takes.first { $0.id == request.anchor.id && selected.contains($0.id) }
+                            ?? takes.first { selected.contains($0.id) }
+                        selected = retained.map { Set([$0.id]) } ?? []
+                    }
                 }
                 if hasBacking {
                     Text("\(request.anchor.accompanimentPath == nil ? "MV 音轨" : "录唱伴奏") · \(pitchLabel) · 选择要导出的人声")
