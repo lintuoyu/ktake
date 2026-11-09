@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "songs": [
+    {
+      "id": "aimer-ref-rain",
+      "title": "Ref:rain",
+      "artist": "Aimer",
+      "accompaniment": "Songs/Aimer/Ref-rain/accompaniment.mp3",
+      "duration": 121.025306,
+      "notes": "用户提供的伴奏，约 2 分 01 秒版本。",
+      "sha256": "6227e2d68fd67463a859379cc55016468e095f985ca0ab9ed679d1ca2d9b2d64"
+    }
+  ]
+}
