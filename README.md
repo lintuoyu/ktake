@@ -4,7 +4,7 @@ KTake 可以从歌曲里提取伴奏，跟着 MV 和同步歌词练唱。录下�
 
 ## 安装
 
-在 [GitHub Releases](https://github.com/lintuoyu/ktake/releases/latest) 下载 DMG，打开后把 KTake 拖到「应用程序」。支持 **macOS 14 及以上**，兼容 Apple 芯片和 Intel Mac。
+在 [GitHub Releases](https://github.com/rifflelin/ktake/releases/latest) 下载 DMG，打开后把 KTake 拖到「应用程序」。支持 **macOS 14 及以上**，兼容 Apple 芯片和 Intel Mac。
 
 安装包内置 GarageBand 工程模板，无需另行下载。要打开导出的 `.band` 工程，Mac 上需要安装 GarageBand。
 
