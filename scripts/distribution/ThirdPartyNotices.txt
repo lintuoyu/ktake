@@ -1,0 +1,27 @@
+KTake includes the following components:
+
+go-music-dl v1.1.5 (GNU AGPL v3)
+https://github.com/guohuiyuan/go-music-dl/tree/v1.1.5
+See go-music-dl-LICENSE and go-music-dl-v1.1.5-source.tar.gz in this directory.
+The archive includes KTake's helper entry point, the changes for embedded mode,
+its build script, and the source and notices for the vendored Go modules.
+
+Optional model downloads
+
+Kim Vocal 2 MLX weights (MIT)
+https://huggingface.co/mlx-community/mel-roformer-kim-vocal-2-mlx/tree/64cbfcb004e39430e5f584552c05949440ec39ce
+The license is saved alongside the downloaded weights.
+
+UVR-MDX-NET Inst HQ3 (TRvlvr/UVR, MLX conversion by ssmall256)
+https://huggingface.co/ssmall256/mlx-audio-separator/blob/f262b68663e2fc6a9d43bd78bd78ca65cd83cd48/cards/uvr-mdx-net-inst-hq3.md
+The model card records no weight-specific redistribution license.
+
+Small Karaoke (Gabox / Aufr33)
+https://huggingface.co/GaboxR67/MelBandRoformers/tree/48bb486bc68985ec90eeca6be5eb9003304b6a49/melbandroformers/karaoke
+KTake uses an MLX safetensors conversion of small_karaoke_gaboxaufr.ckpt.
+The upstream model repository does not state a model weight license.
+
+CPython 3.12.12, built by Python Build Standalone
+https://github.com/astral-sh/python-build-standalone/releases/tag/20251014
+See ../SeparationRuntime/lib/python3.12/LICENSE.txt and the license files in the
+installed package metadata under ../SeparationRuntime/lib/python3.12/site-packages.

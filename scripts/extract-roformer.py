@@ -1,45 +1,41 @@
+import os
 import sys
 from pathlib import Path
 
+from separation_model_files import cached_model_file
 from separation_progress import ExtractionProgress
 
 
-def load_model(cache, progress):
-    from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
-
-    files = ("config.json", "model.safetensors")
-    options = dict(
-        repo_id="mlx-community/mel-roformer-kim-vocal-2-mlx",
-        revision="64cbfcb004e39430e5f584552c05949440ec39ce",
-        cache_dir=cache,
-        allow_patterns=files,
-    )
-    try:
-        model_dir = Path(snapshot_download(**options, local_files_only=True))
-    except LocalEntryNotFoundError:
-        model_dir = None
-    if model_dir is None or not all((model_dir / name).is_file() for name in files):
-        model_dir = Path(snapshot_download(**options))
-
-    progress.update("loadingModel")
-    from mlx_audio.sts.models.mel_roformer import MelRoFormer
-
-    return MelRoFormer.from_pretrained(model_dir).eval()
+MODEL_URL = (
+    "https://huggingface.co/mlx-community/mel-roformer-kim-vocal-2-mlx/resolve/"
+    "64cbfcb004e39430e5f584552c05949440ec39ce/"
+)
 
 
-def extract(source, destination, cache, progress_path=None):
+def download_model(directory):
+    files = {
+        "config.json": "3300eacac960ab46933ef6df6b838eb35de1f0321db9242c1b06e6d2a6a62b58",
+        "LICENSE": "1aa245b55067df5c63c847894e7040f76fa79ddde83e9e5ed8a5c29ef1865c14",
+        "model.safetensors": "312c38e5b698f8dfaa4d6064e8f79010744825828917871a9d22673a43eb7fe5",
+    }
+    for name, checksum in files.items():
+        cached_model_file(directory, name, MODEL_URL + name, checksum)
+
+
+def extract(source, destination, model_dir, progress_path=None):
     progress = ExtractionProgress(progress_path)
-    progress.update("preparingModel")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    progress.update("loadingModel")
     import mlx.core as mx
     import numpy as np
     import soundfile as sf
+    from mlx_audio.sts.models.mel_roformer import MelRoFormer
 
     audio, rate = sf.read(source, dtype="float32", always_2d=True)
     if rate != 44100 or audio.shape[1] != 2 or len(audio) == 0:
         raise ValueError("Expected nonempty 44.1 kHz stereo audio")
 
-    model = load_model(cache, progress)
+    model = MelRoFormer.from_pretrained(model_dir).eval()
     chunk = 352800
     hop = chunk // 2
     ramp = np.linspace(0, 1, hop, dtype=np.float32)[:, None]
@@ -65,4 +61,7 @@ def extract(source, destination, cache, progress_path=None):
 
 
 if __name__ == "__main__":
-    extract(*sys.argv[1:])
+    if sys.argv[1] == "--download":
+        download_model(Path(sys.argv[2]))
+    else:
+        extract(*(Path(argument) for argument in sys.argv[1:]))

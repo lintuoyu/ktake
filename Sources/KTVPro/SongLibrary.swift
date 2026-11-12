@@ -6,6 +6,7 @@ struct MusicDLReference: Codable, Sendable {
     let album: String
     let identifiers: [String: String]
     let localPath: String?
+    var localDirectory: String? = nil
 
     var isLocal: Bool { source == "local" || source == "local-file" }
 }
@@ -31,8 +32,7 @@ struct SongLibrary {
     let songs: [LibrarySong]
     static var bundledRoot: URL? { Bundle.main.resourceURL?.appendingPathComponent("SongLibrary", isDirectory: true) }
     static var userRoot: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("KTV Pro/SongLibrary", isDirectory: true)
+        StorageLocations.dataRoot.appendingPathComponent("SongLibrary", isDirectory: true)
     }
 
     init(root: URL) throws {

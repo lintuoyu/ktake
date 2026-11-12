@@ -68,7 +68,10 @@ struct ContentView: View {
             lyricNavigationSheet
         }
         .sheet(isPresented: $musicDLSearch) {
-            MusicDLSearchSheet { [weak model] song in model?.musicDLSongAdded(song) }
+            if let importer = model.musicDLImporter {
+                MusicDLSearchSheet(importer: importer) { [weak model] song in model?.musicDLSongAdded(song) }
+                    .id(model.musicDLDownloadDirectory)
+            }
         }
         .alert("需要处理", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             if model.permissionDenied {
@@ -78,6 +81,19 @@ struct ContentView: View {
             }
             Button("知道了", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
+        .alert("下载伴奏分离模型", isPresented: Binding(get: { model.modelDownloadRequest != nil },
+                                                   set: { if !$0 { model.modelDownloadRequest = nil } }),
+               presenting: model.modelDownloadRequest) { request in
+            Button("下载并提取") {
+                Task { @MainActor in
+                    model.extractAccompaniment(for: request.song, version: request.version,
+                                               approvedModelDirectory: request.directory)
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { request in
+            Text("模型目录中没有完整的「\(request.model.rawValue)」。联网下载\(request.model.downloadSize)后，即可提取伴奏。\n\n存放位置\n\(request.directory.path)")
+        }
     }
 
     private func openLyricSearch() { lyricSearch = model.lyricSearchContext() }
@@ -513,6 +529,7 @@ struct ContentView: View {
 
     private func extractionStatus(_ progress: AccompanimentExtractor.Progress, name: String) -> some View {
         let message = switch progress.phase {
+        case .downloadingModel: "\(name) · 正在下载模型…"
         case .preparingModel: "\(name) · 正在准备模型…"
         case .loadingModel: "\(name) · 正在加载模型…"
         case .separating: "\(name) · 正在分离人声"

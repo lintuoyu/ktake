@@ -44,27 +44,25 @@ def model_config():
     }
 
 
-def prepare_weights(cache, work_directory):
-    destination = cache / "model.safetensors"
-    if destination.is_file():
-        return destination
-
+def convert_weights(checkpoint):
     from mlx_audio_separator.separator.models.roformer.loader import load_roformer_model
 
-    # Keep partial downloads and conversions in the app's per-job staging directory.
-    with tempfile.TemporaryDirectory(dir=work_directory) as temporary:
+    os.environ["MLX_SAVE_SAFETENSORS"] = "1"
+    load_roformer_model(str(checkpoint), model_config())
+    converted = checkpoint.with_suffix(".safetensors")
+    if not converted.is_file():
+        raise ValueError("Small Karaoke model conversion failed")
+    return converted
+
+
+def download_model(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=directory) as temporary:
         checkpoint = cached_model_file(Path(temporary), WEIGHTS_NAME, WEIGHTS_URL, WEIGHTS_SHA256)
-        os.environ["MLX_SAVE_SAFETENSORS"] = "1"
-        load_roformer_model(str(checkpoint), model_config())
-        converted = checkpoint.with_suffix(".safetensors")
-        if not converted.is_file():
-            raise ValueError("Small Karaoke model conversion failed")
-        cache.mkdir(parents=True, exist_ok=True)
-        converted.replace(destination)
-    return destination
+        convert_weights(checkpoint).replace(directory / "model.safetensors")
 
 
-def extract(source, destination, cache, progress_path=None):
+def extract(source, destination, model_dir, progress_path=None):
     progress = ExtractionProgress(progress_path)
     progress.update("preparingModel")
 
@@ -78,7 +76,7 @@ def extract(source, destination, cache, progress_path=None):
     if rate != SAMPLE_RATE or audio.shape[1] != 2 or len(audio) == 0:
         raise ValueError("Expected nonempty 44.1 kHz stereo audio")
 
-    weights = prepare_weights(cache, destination.parent)
+    weights = model_dir / "model.safetensors"
     progress.update("loadingModel")
     config = model_config()
     # The MLX separator takes the step between chunks in seconds.
@@ -115,4 +113,7 @@ def extract(source, destination, cache, progress_path=None):
 
 
 if __name__ == "__main__":
-    extract(*(Path(argument) for argument in sys.argv[1:]))
+    if sys.argv[1] == "--download":
+        download_model(Path(sys.argv[2]))
+    else:
+        extract(*(Path(argument) for argument in sys.argv[1:]))

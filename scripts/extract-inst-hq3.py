@@ -15,7 +15,12 @@ WEIGHTS_SHA256 = "72c307239fbc415c9f3c1ef83fee38d19ac98b4b893f1a5afc4345296f48ee
 CONFIG_SHA256 = "d8df573c2b0248e3ce77eb8f0fc3c528c9db5368f38335e249e25e05e84415ba"
 
 
-def extract(source, destination, cache, progress_path=None):
+def download_model(directory):
+    cached_model_file(directory, "config.json", MODEL_URL + "config.json", CONFIG_SHA256)
+    cached_model_file(directory, "model.safetensors", MODEL_URL + "model.safetensors", WEIGHTS_SHA256)
+
+
+def extract(source, destination, model_dir, progress_path=None):
     progress = ExtractionProgress(progress_path)
     progress.update("preparingModel")
     import numpy as np
@@ -25,8 +30,8 @@ def extract(source, destination, cache, progress_path=None):
     if rate != 44100 or audio.shape[1] != 2 or len(audio) == 0:
         raise ValueError("Expected nonempty 44.1 kHz stereo audio")
 
-    weights = cached_model_file(cache, "model.safetensors", MODEL_URL + "model.safetensors", WEIGHTS_SHA256)
-    config = cached_model_file(cache, "config.json", MODEL_URL + "config.json", CONFIG_SHA256)
+    weights = model_dir / "model.safetensors"
+    config = model_dir / "config.json"
     progress.update("loadingModel")
     from mlx_audio_separator.separator.architectures import mdx_separator
 
@@ -53,4 +58,7 @@ def extract(source, destination, cache, progress_path=None):
 
 
 if __name__ == "__main__":
-    extract(*(Path(argument) for argument in sys.argv[1:]))
+    if sys.argv[1] == "--download":
+        download_model(Path(sys.argv[2]))
+    else:
+        extract(*(Path(argument) for argument in sys.argv[1:]))

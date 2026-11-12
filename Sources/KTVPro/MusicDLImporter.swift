@@ -57,18 +57,22 @@ struct MusicDLTrack: Sendable {
 }
 
 actor MusicDLImporter {
-    static let baseURL = URL(string: "http://127.0.0.1:18080/music")!
-    static let downloadFolder = URL(fileURLWithPath: "/Volumes/Elements/DownloadedMusic", isDirectory: true)
-    private let baseURL: URL
-    private let folder: URL
+    private let service: MusicDLService
+    private let testBaseURL: URL?
+    nonisolated let downloadLocation: MusicDLDownloadLocation
+    private let testFolder: URL?
     private let libraryRoot: URL
     private let session: URLSession
     private let lyricClient: LyricSearchClient
 
-    init(baseURL: URL = MusicDLImporter.baseURL, folder: URL = MusicDLImporter.downloadFolder,
-         libraryRoot: URL = SongLibrary.userRoot, lyricClient: LyricSearchClient = .shared) {
-        self.baseURL = baseURL
-        self.folder = folder
+    init(baseURL: URL? = nil, folder: URL? = nil,
+         libraryRoot: URL = SongLibrary.userRoot, lyricClient: LyricSearchClient = .shared,
+         serviceDirectory: URL? = nil) {
+        let directory = serviceDirectory ?? libraryRoot.deletingLastPathComponent().appendingPathComponent("MusicDL", isDirectory: true)
+        self.service = MusicDLService(directory: directory)
+        self.testBaseURL = baseURL
+        self.downloadLocation = MusicDLDownloadLocation(serviceDirectory: directory)
+        self.testFolder = folder
         self.libraryRoot = libraryRoot
         self.lyricClient = lyricClient
         let configuration = URLSessionConfiguration.ephemeral
@@ -77,10 +81,25 @@ actor MusicDLImporter {
         session = URLSession(configuration: configuration)
     }
 
+    func serviceURL() async throws -> URL {
+        if let testBaseURL { return testBaseURL }
+        return try await service.baseURL()
+    }
+
+    func stopService() async { await service.stop() }
+
+    func setDownloadDirectory(_ folder: URL?) throws -> URL? {
+        try downloadLocation.setCustomDirectory(folder)
+    }
+
+    private var downloadDirectory: URL {
+        testFolder ?? downloadLocation.customDirectory ?? downloadLocation.defaultDirectory
+    }
+
     func add(_ track: MusicDLTrack) async throws -> LibrarySong {
         try Task.checkCancellation()
-        let origin = track.originalURL ?? endpoint("search", query: [URLQueryItem(name: "q", value: track.title + " " + track.artist),
-                                                                      URLQueryItem(name: "sources", value: track.source)])
+        let folder = downloadDirectory
+        let origin = track.originalURL ?? Self.attribution(id: track.id, source: track.source, kind: "track")
         let local: URL?
         let path: String?
         if track.source == "local" || track.source == "local-file" {
@@ -88,15 +107,18 @@ actor MusicDLImporter {
             let padded = base64.padding(toLength: (base64.count + 3) / 4 * 4, withPad: "=", startingAt: 0)
             let decoded = Data(base64Encoded: padded).flatMap { String(data: $0, encoding: .utf8) }
             path = track.metadata["rel_path"] ?? decoded
-            local = path.flatMap { localFile(at: $0) }
+            local = path.flatMap { localFile(at: $0, in: folder) }
+            guard local != nil else { throw AppFailure(message: "当前下载目录中找不到这首歌，请检查外置硬盘或重新加载列表。") }
         } else {
-            local = await matchingLocalFile(title: track.title, artist: track.artist, duration: track.duration)
-            path = local.map { String($0.path.dropFirst(folder.resolvingSymlinksInPath().standardizedFileURL.path.count + 1)) }
+            local = await matchingLocalFile(title: track.title, artist: track.artist, duration: track.duration, in: folder)
+            let prefix = Self.directoryPrefix(folder.resolvingSymlinksInPath().standardizedFileURL)
+            path = local.map { String($0.path.dropFirst(prefix.count)) }
         }
         // Keep stable media identifiers only. The web page may also carry short-lived URLs or credentials.
         let identifierKeys: Set<String> = ["album_id", "media_mid", "mid", "songmid", "hash", "cid", "bvid", "aid", "audio_id", "isrc"]
         let reference = MusicDLReference(id: track.id, source: track.source, album: track.album,
-                                         identifiers: track.metadata.filter { identifierKeys.contains($0.key) }, localPath: path)
+                                         identifiers: track.metadata.filter { identifierKeys.contains($0.key) }, localPath: path,
+                                         localDirectory: path != nil && folder != downloadLocation.defaultDirectory ? folder.path : nil)
         if let existing = try LibraryImporter.musicDLSong(reference: reference, origin: origin,
                                                            duration: track.duration, root: libraryRoot) { return existing }
         let seconds = local.flatMap { Self.audioDuration($0) } ?? track.duration
@@ -120,48 +142,61 @@ actor MusicDLImporter {
     }
 
     private func sourceLyric(for track: MusicDLTrack) async -> LyricAttachment? {
-        let url = endpoint("lyric", query: track.query + [URLQueryItem(name: "format", value: "lrc")])
-        guard let (data, response) = try? await session.data(from: url),
+        guard let url = try? await endpoint("lyric", query: track.query + [URLQueryItem(name: "format", value: "lrc")]),
+              let (data, response) = try? await session.data(from: url),
               let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
               data.count <= 512_000, let lrc = String(data: data, encoding: .utf8) else { return nil }
         // Preserve source attribution without storing provider tokens that may be in extra.
-        return LyricAttachment(lrc: lrc, sourceURL: endpoint("lyric", query: [
-            URLQueryItem(name: "id", value: track.id), URLQueryItem(name: "source", value: track.source)
-        ]).absoluteString)
+        return LyricAttachment(lrc: lrc, sourceURL: Self.attribution(id: track.id, source: track.source, kind: "lyric").absoluteString)
     }
 
     nonisolated func availableAudio(for song: LibrarySong, library: SongLibrary) -> URL? {
         guard let reference = song.musicDL else { return try? library.url(song.accompaniment) }
-        if let local = reference.localPath.flatMap({ localFile(at: $0) }) { return local }
-        guard let folder = playbackFolder(for: song, library: library),
-              let entries = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return nil }
-        return entries.first {
-            $0.deletingPathExtension().lastPathComponent == "Playback"
-                && Self.audioExtensions.contains($0.pathExtension.lowercased()) && Self.isRegularFile($0)
+        let folder = reference.localDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? testFolder ?? downloadLocation.defaultDirectory
+        if let local = reference.localPath.flatMap({ localFile(at: $0, in: folder) }) { return local }
+        if let folder = playbackFolder(for: song, library: library),
+           let entries = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil),
+           let cached = entries.first(where: {
+               $0.deletingPathExtension().lastPathComponent == "Playback"
+                   && Self.audioExtensions.contains($0.pathExtension.lowercased()) && Self.isRegularFile($0)
+           }) { return cached }
+        // Older entries can carry the absolute URL of an LRC saved next to the audio.
+        if let path = reference.localPath, let source = song.lyricsSourceURL,
+           let sidecar = URL(string: source), sidecar.isFileURL, sidecar.pathExtension.lowercased() == "lrc" {
+            let filename = URL(fileURLWithPath: path).lastPathComponent
+            let audio = sidecar.deletingLastPathComponent().appendingPathComponent(filename)
+            if Self.audioExtensions.contains(audio.pathExtension.lowercased()),
+               audio.deletingPathExtension() == sidecar.deletingPathExtension(), Self.isRegularFile(audio) {
+                return audio
+            }
         }
+        return nil
     }
 
     func prepareAudio(for song: LibrarySong, library: SongLibrary) async throws -> URL {
         if let file = availableAudio(for: song, library: library) { return file }
         guard let reference = song.musicDL, !reference.isLocal,
               let cache = playbackFolder(for: song, library: library) else {
-            throw AppFailure(message: "找不到原音频，请确认外置盘已连接、文件仍在原位置。")
+            throw AppFailure(message: "找不到原音频。若这首歌来自旧版 music-dl 的本地下载，请在曲库重新导入原文件。")
         }
-        if let local = await matchingLocalFile(title: song.title, artist: song.artist, duration: song.duration) { return local }
+        if let local = await matchingLocalFile(title: song.title, artist: song.artist, duration: song.duration, in: downloadDirectory) {
+            return local
+        }
         if let file = availableAudio(for: song, library: library) { return file }
         try Task.checkCancellation()
         let extra = reference.identifiers.isEmpty ? nil : try String(data: JSONEncoder().encode(reference.identifiers), encoding: .utf8)
         let query = MusicDLTrack.query(id: reference.id, source: reference.source, title: song.title, artist: song.artist,
                                        album: reference.album, duration: song.duration, extra: extra)
         // This is the service's playback route. It does not enqueue or save a music-dl download.
-        let url = endpoint("download", query: query + [URLQueryItem(name: "stream", value: "1")])
+        let url = try await endpoint("download", query: query + [URLQueryItem(name: "stream", value: "1")])
         let (temporary, response) = try await session.download(from: url)
         let files = FileManager.default
         defer { try? files.removeItem(at: temporary) }
         try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode),
               let suffix = Self.audioExtension(response) else {
-            throw AppFailure(message: "该来源暂时无法播放，请确认 music-dl 已启动或换一个来源。")
+            throw AppFailure(message: "该来源暂时无法播放，请稍后重试或换一个来源。")
         }
         if let file = availableAudio(for: song, library: library) { return file }
         let staging = cache.appendingPathComponent(".playback-\(UUID().uuidString)").appendingPathExtension(suffix)
@@ -187,13 +222,17 @@ actor MusicDLImporter {
         return cache
     }
 
-    private nonisolated func localFile(at relative: String) -> URL? {
+    private nonisolated func localFile(at relative: String, in folder: URL) -> URL? {
         guard !relative.hasPrefix("/"), !relative.split(separator: "/").contains("..") else { return nil }
         let root = folder.resolvingSymlinksInPath().standardizedFileURL
         let url = root.appendingPathComponent(relative).resolvingSymlinksInPath().standardizedFileURL
-        guard url.path.hasPrefix(root.path + "/"), Self.audioExtensions.contains(url.pathExtension.lowercased()),
+        guard url.path.hasPrefix(Self.directoryPrefix(root)), Self.audioExtensions.contains(url.pathExtension.lowercased()),
               Self.isRegularFile(url) else { return nil }
         return url
+    }
+
+    private static func directoryPrefix(_ folder: URL) -> String {
+        folder.path.hasSuffix("/") ? folder.path : folder.path + "/"
     }
 
     private struct IndexedTracks: Decodable {
@@ -205,7 +244,7 @@ actor MusicDLImporter {
         let tracks: [Track]
     }
 
-    private func matchingLocalFile(title: String, artist: String, duration: Double?) async -> URL? {
+    private func matchingLocalFile(title: String, artist: String, duration: Double?, in folder: URL) async -> URL? {
         guard !LyricMatcher.searchArtist(artist).isEmpty else { return nil }
         func key(_ value: String) -> String {
             value.precomposedStringWithCompatibilityMapping.lowercased().unicodeScalars
@@ -218,7 +257,7 @@ actor MusicDLImporter {
                                                            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
         var matches: [(URL, Double, Int)] = []
         func addMatch(_ relative: String) {
-            guard let url = localFile(at: relative), let seconds = Self.audioDuration(url) else { return }
+            guard let url = localFile(at: relative, in: root), let seconds = Self.audioDuration(url) else { return }
             let difference = duration.map { abs(seconds - $0) } ?? 0
             if difference <= 5 {
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -229,15 +268,15 @@ actor MusicDLImporter {
             if Task.isCancelled { return nil }
             if Self.audioExtensions.contains(entry.pathExtension.lowercased()),
                names.contains(key(entry.deletingPathExtension().lastPathComponent)) {
-                addMatch(String(entry.path.dropFirst(root.path.count + 1)))
+                addMatch(String(entry.path.dropFirst(Self.directoryPrefix(root).count)))
             }
         }
-        if matches.isEmpty {
+        if matches.isEmpty, let url = try? await endpoint("local_music", query: []) {
             // The service's index also recognizes tracks with a custom filename or subfolder.
-            let request = URLRequest(url: endpoint("local_music", query: []), timeoutInterval: 5)
+            let request = URLRequest(url: url, timeoutInterval: 5)
             if let (data, response) = try? await session.data(for: request),
                (response as? HTTPURLResponse)?.statusCode == 200,
-               let index = try? JSONDecoder().decode(IndexedTracks.self, from: data) {
+               downloadDirectory == folder, let index = try? JSONDecoder().decode(IndexedTracks.self, from: data) {
                 let titleKey = key(title), artistKey = key(artist)
                 for track in index.tracks where key(track.name) == titleKey && key(track.artist) == artistKey {
                     addMatch(track.rel_path)
@@ -258,9 +297,18 @@ actor MusicDLImporter {
             .map { $0.isRegularFile == true && $0.isSymbolicLink != true } ?? false
     }
 
-    private func endpoint(_ name: String, query: [URLQueryItem]) -> URL {
+    private func endpoint(_ name: String, query: [URLQueryItem]) async throws -> URL {
+        let baseURL = try await serviceURL()
         var url = URLComponents(url: baseURL.appendingPathComponent(name), resolvingAgainstBaseURL: false)!
         url.queryItems = query
+        return url.url!
+    }
+
+    private static func attribution(id: String, source: String, kind: String) -> URL {
+        var url = URLComponents()
+        url.scheme = "music-dl"
+        url.host = kind
+        url.queryItems = [URLQueryItem(name: "id", value: id), URLQueryItem(name: "source", value: source)]
         return url.url!
     }
 

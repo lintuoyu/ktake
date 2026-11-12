@@ -71,14 +71,14 @@ struct Take: Identifiable, Codable {
         return "name:\(songName)"
     }
     static var directory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("KTV Pro/Takes", isDirectory: true)
+        StorageLocations.dataRoot.appendingPathComponent("Takes", isDirectory: true)
     }
 
     /// Recordings can refer to a song inside an older copy of the application bundle.
     static func recordedMediaURL(_ path: String, bundledRoot: URL? = Bundle.main.resourceURL?
         .appendingPathComponent("SongLibrary", isDirectory: true)) -> URL {
         let original = URL(fileURLWithPath: path).standardizedFileURL
+        if let relocated = StorageLocations.relocatedMedia(original) { return relocated }
         guard let bundledRoot else { return original }
         let parts = original.pathComponents
         let bundleNames = ["KTV Pro.app", "KTake.app"]

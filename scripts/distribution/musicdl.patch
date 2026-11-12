@@ -1,0 +1,473 @@
+--- a/internal/web/server.go
++++ b/internal/web/server.go
+@@ -528,6 +528,8 @@
+ 	DisableAuth       bool
+ 	ListenHost        string
+ 	BasePath          string
++	Embedded          context.Context
++	Ready             func(net.Addr) error
+ }
+ 
+ func Start(port string, shouldOpenBrowser bool, basePath string) {
+@@ -560,7 +562,30 @@
+ 
+ 	gin.SetMode(gin.ReleaseMode)
+ 	r := gin.Default()
+-	r.Use(corsMiddleware(), gzipMiddleware())
++	var listenAddress string
++	if opts.Embedded == nil {
++		r.Use(corsMiddleware())
++	} else {
++		r.Use(func(c *gin.Context) {
++			origin := c.GetHeader("Origin")
++			path := c.Request.URL.Path
++			// The unguessable prefix is shared only with the app. Do not redirect
++			// the server root to it or let cross-site requests access it.
++			if c.Request.Host != listenAddress {
++				c.AbortWithStatus(http.StatusForbidden)
++				return
++			}
++			if (origin != "" && origin != "http://"+listenAddress) ||
++				c.GetHeader("Sec-Fetch-Site") == "cross-site" ||
++				(path != RoutePrefix && !strings.HasPrefix(path, RoutePrefix+"/")) {
++				c.AbortWithStatus(http.StatusNotFound)
++				return
++			}
++			c.Header("Referrer-Policy", "no-referrer")
++			c.Next()
++		})
++	}
++	r.Use(gzipMiddleware())
+ 
+ 	tmpl := template.Must(template.New("").Funcs(template.FuncMap{
+ 		"artistTokens":       splitArtistTokens,
+@@ -643,6 +668,9 @@
+ 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid settings payload"})
+ 			return
+ 		}
++		if opts.Embedded != nil {
++			req.DownloadDir = core.DefaultWebDownloadDir
++		}
+ 		if err := core.SaveWebSettings(req); err != nil {
+ 			status := http.StatusInternalServerError
+ 			if errors.Is(err, core.ErrInvalidWebSettings) {
+@@ -659,8 +687,10 @@
+ 	RegisterQRLoginRoutes(configAPI)
+ 	RegisterCollectionRoutes(api)
+ 	RegisterLocalMusicRoutes(api)
+-	RegisterVideogenRoutes(api, videoDir)
+-	RegisterUpdateRoutes(api)
++	if opts.Embedded == nil {
++		RegisterVideogenRoutes(api, videoDir)
++		RegisterUpdateRoutes(api)
++	}
+ 
+ 	queue, err := core.OpenDownloadQueue()
+ 	if err != nil {
+@@ -680,7 +710,13 @@
+ 		return
+ 	}
+ 
+-	queueContext, stopQueue := context.WithCancel(context.Background())
++	defer listener.Close()
++	listenAddress = listener.Addr().String()
++	queueParent := opts.Embedded
++	if queueParent == nil {
++		queueParent = context.Background()
++	}
++	queueContext, stopQueue := context.WithCancel(queueParent)
+ 	defer stopQueue()
+ 	if err := queue.Start(queueContext, processQueuedDownload); err != nil {
+ 		_ = listener.Close()
+@@ -692,12 +728,31 @@
+ 	if urlHost == "" || urlHost == "0.0.0.0" || urlHost == "::" {
+ 		urlHost = "localhost"
+ 	}
++	port = strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+ 	urlStr := "http://" + urlHost + ":" + port + RoutePrefix
+ 	fmt.Printf("Web started at %s\n", urlStr)
+ 	if opts.ShouldOpenBrowser {
+ 		go func() { time.Sleep(500 * time.Millisecond); core.OpenBrowser(urlStr) }()
+ 	}
+-	if err := http.Serve(listener, r); err != nil && !errors.Is(err, http.ErrServerClosed) {
++	server := &http.Server{Handler: r, ReadHeaderTimeout: 10 * time.Second}
++	if opts.Ready != nil {
++		if err := opts.Ready(listener.Addr()); err != nil {
++			fmt.Fprintf(os.Stderr, "Notify KTake: %v\n", err)
++			return
++		}
++	}
++	if opts.Embedded != nil {
++		stopped := make(chan struct{})
++		defer close(stopped)
++		go func() {
++			select {
++			case <-opts.Embedded.Done():
++				_ = server.Close()
++			case <-stopped:
++			}
++		}()
++	}
++	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+ 		fmt.Fprintf(os.Stderr, "Web server stopped with error: %v\n", err)
+ 	}
+ }
+--- a/core/config_store.go
++++ b/core/config_store.go
+@@ -502,8 +502,20 @@
+ 	return filepath.Clean(dir)
+ }
+ 
+-func GetWebSettings() WebSettings {
+-	settings := defaultWebSettings()
++func GetWebSettings() (settings WebSettings) {
++	// KTake owns the location. Read it for each request so a change never
++	// interrupts downloads already queued with their original directory.
++	defer func() {
++		if file := os.Getenv("KTAKE_MUSIC_DL_DIRECTORY_FILE"); file != "" {
++			settings.DownloadDir = DefaultWebDownloadDir
++			var directory string
++			if data, err := os.ReadFile(file); err == nil &&
++				json.Unmarshal(data, &directory) == nil && filepath.IsAbs(directory) {
++				settings.DownloadDir = filepath.Clean(directory)
++			}
++		}
++	}()
++	settings = defaultWebSettings()
+ 	if err := ensureConfigDB(); err != nil {
+ 		return settings
+ 	}
+--- a/core/download.go
++++ b/core/download.go
+@@ -145,6 +145,19 @@
+ 	return saveDownloadedSongToFileWithLyricSidecar(result, outDir, GetWebSettings().DownloadLyricsToLocal)
+ }
+ 
++// PrepareDownloadDirectory does not recreate an unavailable user-selected
++// directory, which could otherwise write to the system disk after an eject.
++func PrepareDownloadDirectory(directory string) error {
++	if os.Getenv("KTAKE_MUSIC_DL_DIRECTORY_FILE") != "" && filepath.IsAbs(directory) {
++		info, err := os.Stat(directory)
++		if err != nil || !info.IsDir() {
++			return errors.New("无法访问所选下载目录，请连接外置硬盘或在 KTake 设置中选择其他文件夹")
++		}
++		return nil
++	}
++	return os.MkdirAll(directory, 0755)
++}
++
+ func saveDownloadedSongToFileWithLyricSidecar(result *DownloadedSong, outDir string, exportLyrics bool) (*DownloadedSong, error) {
+ 	if result == nil {
+ 		return nil, errors.New("download result is nil")
+@@ -152,7 +165,7 @@
+ 
+ 	targetDir := DownloadDirOrDefault(outDir)
+ 
+-	if err := os.MkdirAll(targetDir, 0755); err != nil {
++	if err := PrepareDownloadDirectory(targetDir); err != nil {
+ 		return nil, err
+ 	}
+ 
+--- a/core/download_record.go
++++ b/core/download_record.go
+@@ -423,6 +423,11 @@
+ }
+ 
+ func DownloadWithDedupCheckWithTemplate(song *model.Song, outDir string, withCover, withLyrics bool, filenameTemplate string, dedupSet DownloadDedupIndex) (*DownloadedSong, error) {
++	if os.Getenv("KTAKE_MUSIC_DL_DIRECTORY_FILE") != "" && filepath.IsAbs(outDir) {
++		if err := PrepareDownloadDirectory(outDir); err != nil {
++			return nil, err
++		}
++	}
+ 	key := SongKey(song)
+ 	if IsSongStillDownloaded(song, dedupSet, outDir) {
+ 		_ = SaveDownloadRecord(song.Name, song.Artist, song.Source, DownloadStatusSkipped, "")
+--- a/internal/web/open_download_dir.go
++++ b/internal/web/open_download_dir.go
+@@ -25,7 +25,7 @@
+ 	if err != nil {
+ 		return "", fmt.Errorf("resolve download directory: %w", err)
+ 	}
+-	if err := os.MkdirAll(absolute, 0o755); err != nil {
++	if err := core.PrepareDownloadDirectory(target); err != nil {
+ 		return "", fmt.Errorf("create download directory: %w", err)
+ 	}
+ 	info, err := os.Stat(absolute)
+--- a/internal/web/local_music.go
++++ b/internal/web/local_music.go
+@@ -1297,7 +1297,7 @@
+ 	}
+ 
+ 	dir := localMusicDownloadDir()
+-	if err := os.MkdirAll(dir, 0755); err != nil {
++	if err := core.PrepareDownloadDirectory(dir); err != nil {
+ 		return nil, err
+ 	}
+ 	rootAbs, err := filepath.Abs(dir)
+--- a/internal/web/music.go
++++ b/internal/web/music.go
+@@ -1684,7 +1684,7 @@
+ 		targetDir = core.DefaultWebDownloadDir
+ 	}
+ 	targetDir = filepath.Clean(targetDir)
+-	if err := os.MkdirAll(targetDir, 0755); err != nil {
++	if err := core.PrepareDownloadDirectory(targetDir); err != nil {
+ 		return "", "", err
+ 	}
+ 	savedFilename := utils.SanitizeFilename(strings.TrimSpace(filename))
+@@ -1716,6 +1716,9 @@
+ 	savedFilename := filepath.FromSlash(cleanedName)
+ 	if filepath.VolumeName(savedFilename) != "" {
+ 		return "", "", fmt.Errorf("invalid relative filename")
++	}
++	if err := core.PrepareDownloadDirectory(targetDir); err != nil {
++		return "", "", err
+ 	}
+ 	savedPath := filepath.Join(targetDir, savedFilename)
+ 	if !isPathInside(targetDir, savedPath) {
+--- a/internal/web/download_queue.go
++++ b/internal/web/download_queue.go
+@@ -51,13 +51,18 @@
+ 			return
+ 		}
+ 		settings := core.GetWebSettings()
++		directory := core.DownloadDirOrDefault(settings.DownloadDir)
++		if err := core.PrepareDownloadDirectory(directory); err != nil {
++			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++			return
++		}
+ 		inputs := make([]core.DownloadTaskInput, 0, len(req.Songs))
+ 		for _, s := range req.Songs {
+ 			if strings.TrimSpace(s.ID) == "" || strings.TrimSpace(s.Source) == "" || isLocalMusicSource(s.Source) {
+ 				c.JSON(400, gin.H{"error": "歌曲缺少 ID 或音源，或属于本地音乐"})
+ 				return
+ 			}
+-			inputs = append(inputs, core.DownloadTaskInput{Song: model.Song{ID: s.ID, Source: s.Source, Name: s.Name, Artist: s.Artist, Album: s.Album, Cover: s.Cover, Extra: parseSongExtraQuery(s.Extra)}, Directory: core.DownloadDirOrDefault(settings.DownloadDir), FilenameTemplate: settings.DownloadFilenameTemplate, Embed: s.Embed})
++			inputs = append(inputs, core.DownloadTaskInput{Song: model.Song{ID: s.ID, Source: s.Source, Name: s.Name, Artist: s.Artist, Album: s.Album, Cover: s.Cover, Extra: parseSongExtraQuery(s.Extra)}, Directory: directory, FilenameTemplate: settings.DownloadFilenameTemplate, Embed: s.Embed})
+ 		}
+ 		added, err := queue.Enqueue(req.RequestID, inputs)
+ 		if err != nil {
+--- a/internal/web/local_music_index.go
++++ b/internal/web/local_music_index.go
+@@ -10,6 +10,7 @@
+ 
+ 	"github.com/guohuiyuan/go-music-dl/core"
+ 	"github.com/guohuiyuan/music-lib/model"
++	"gorm.io/gorm"
+ 	"gorm.io/gorm/clause"
+ )
+ 
+@@ -22,22 +23,32 @@
+ } // LocalMusicIndex 是下载目录的搜索索引行。磁盘文件仍是唯一真相，
+ // 该表只用于加速对大量本地文件的关键词搜索。主键沿用 base64(相对路径)。
+ type LocalMusicIndex struct {
+-	ID        string    `gorm:"column:id;primaryKey"`
+-	RelPath   string    `gorm:"column:rel_path;uniqueIndex;not null"`
+-	Name      string    `gorm:"column:name;index"`
+-	Artist    string    `gorm:"column:artist;index"`
+-	Album     string    `gorm:"column:album;index"`
+-	Duration  int       `gorm:"column:duration"`
+-	Size      int64     `gorm:"column:size"`
+-	Ext       string    `gorm:"column:ext"`
+-	Cover     string    `gorm:"column:cover"`
+-	HasCover  bool      `gorm:"column:has_cover"`
+-	HasLyric  bool      `gorm:"column:has_lyric"`
+-	ModTime   time.Time `gorm:"column:mod_time"`
+-	ScannedAt time.Time `gorm:"column:scanned_at;index"`
++	DownloadRoot string    `gorm:"column:download_root;index"`
++	ID           string    `gorm:"column:id;primaryKey"`
++	RelPath      string    `gorm:"column:rel_path;uniqueIndex;not null"`
++	Name         string    `gorm:"column:name;index"`
++	Artist       string    `gorm:"column:artist;index"`
++	Album        string    `gorm:"column:album;index"`
++	Duration     int       `gorm:"column:duration"`
++	Size         int64     `gorm:"column:size"`
++	Ext          string    `gorm:"column:ext"`
++	Cover        string    `gorm:"column:cover"`
++	HasCover     bool      `gorm:"column:has_cover"`
++	HasLyric     bool      `gorm:"column:has_lyric"`
++	ModTime      time.Time `gorm:"column:mod_time"`
++	ScannedAt    time.Time `gorm:"column:scanned_at;index"`
+ }
+ 
+ func (LocalMusicIndex) TableName() string { return "local_music_index" }
++
++// KTake can switch folders while this server is running. Legacy rows
++// without a recorded root will be populated on the next disk scan.
++func localMusicIndexForRoot(root string) *gorm.DB {
++	if os.Getenv("KTAKE_MUSIC_DL_DIRECTORY_FILE") != "" {
++		return db.Where("download_root = ?", root)
++	}
++	return db
++}
+ 
+ func containsLocalSource(sources []string) bool {
+ 	for _, s := range sources {
+@@ -118,7 +129,7 @@
+ 	lastID := ""
+ 	for {
+ 		var rows []LocalMusicIndex
+-		query := db.Order("id ASC").Limit(batchSize)
++		query := localMusicIndexForRoot(rootAbs).Order("id ASC").Limit(batchSize)
+ 		if lastID != "" {
+ 			query = query.Where("id > ?", lastID)
+ 		}
+@@ -148,20 +159,27 @@
+ 		}
+ 		hasLyric = track.Extra["lyric"] == "true"
+ 	}
++	root := track.absPath
++	if root != "" {
++		for range strings.Split(filepath.ToSlash(track.RelPath), "/") {
++			root = filepath.Dir(root)
++		}
++	}
+ 	return LocalMusicIndex{
+-		ID:        track.ID,
+-		RelPath:   track.RelPath,
+-		Name:      track.Name,
+-		Artist:    track.Artist,
+-		Album:     track.Album,
+-		Duration:  track.Duration,
+-		Size:      track.Size,
+-		Ext:       track.Ext,
+-		Cover:     track.Cover,
+-		HasCover:  hasCover,
+-		HasLyric:  hasLyric,
+-		ModTime:   track.modTime,
+-		ScannedAt: scannedAt,
++		DownloadRoot: root,
++		ID:           track.ID,
++		RelPath:      track.RelPath,
++		Name:         track.Name,
++		Artist:       track.Artist,
++		Album:        track.Album,
++		Duration:     track.Duration,
++		Size:         track.Size,
++		Ext:          track.Ext,
++		Cover:        track.Cover,
++		HasCover:     hasCover,
++		HasLyric:     hasLyric,
++		ModTime:      track.modTime,
++		ScannedAt:    scannedAt,
+ 	}
+ }
+ 
+@@ -206,7 +224,7 @@
+ // 只在扫描到至少一个音频文件时才动去重索引：下载目录被整个清空（或挂载点掉了）
+ // 时宁可保守，避免一次性清光下载去重记录。
+ func reconcileDownloadDedupWithScan(tracks []*localMusicTrack, outDir string) {
+-	if len(tracks) == 0 {
++	if len(tracks) == 0 || os.Getenv("KTAKE_MUSIC_DL_DIRECTORY_FILE") != "" {
+ 		return
+ 	}
+ 	keep := make(map[string]string, len(tracks))
+@@ -275,8 +293,9 @@
+ 		return nil, 0, false
+ 	}
+ 
++	rootAbs, _ := filepath.Abs(localMusicDownloadDir())
+ 	var total int64
+-	if err := db.Model(&LocalMusicIndex{}).Count(&total).Error; err != nil || total == 0 {
++	if err := localMusicIndexForRoot(rootAbs).Model(&LocalMusicIndex{}).Count(&total).Error; err != nil || total == 0 {
+ 		return nil, 0, false
+ 	}
+ 
+@@ -284,11 +303,10 @@
+ 	if limit <= 0 {
+ 		limit = 200
+ 	}
+-	if err := db.Order("mod_time DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
++	if err := localMusicIndexForRoot(rootAbs).Order("mod_time DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+ 		return nil, 0, false
+ 	}
+ 
+-	rootAbs, _ := filepath.Abs(localMusicDownloadDir())
+ 	tracks := make([]*localMusicTrack, 0, len(rows))
+ 	missingIDs := make([]string, 0)
+ 	for i := range rows {
+@@ -338,7 +356,7 @@
+ 		if err := database.Clauses(clause.OnConflict{
+ 			Columns: []clause.Column{{Name: "id"}},
+ 			DoUpdates: clause.AssignmentColumns([]string{
+-				"rel_path", "name", "artist", "album", "duration", "size",
++				"download_root", "rel_path", "name", "artist", "album", "duration", "size",
+ 				"ext", "cover", "has_cover", "has_lyric", "mod_time", "scanned_at",
+ 			}),
+ 		}).CreateInBatches(rows, 200).Error; err != nil {
+@@ -381,7 +399,7 @@
+ 	}
+ 	lookup := func(query string, args ...interface{}) (*LocalMusicIndex, string, error) {
+ 		var rows []LocalMusicIndex
+-		if err := db.Where(query, args...).Order("mod_time DESC").Limit(20).Find(&rows).Error; err != nil {
++		if err := localMusicIndexForRoot(rootAbs).Where(query, args...).Order("mod_time DESC").Limit(20).Find(&rows).Error; err != nil {
+ 			return nil, "", err
+ 		}
+ 		row, absPath := findExisting(rows)
+@@ -425,7 +443,7 @@
+ 	_ = db.Clauses(clause.OnConflict{
+ 		Columns: []clause.Column{{Name: "id"}},
+ 		DoUpdates: clause.AssignmentColumns([]string{
+-			"rel_path", "name", "artist", "album", "duration", "size",
++			"download_root", "rel_path", "name", "artist", "album", "duration", "size",
+ 			"ext", "cover", "has_cover", "has_lyric", "mod_time", "scanned_at",
+ 		}),
+ 	}).Create(&row).Error
+@@ -451,18 +469,17 @@
+ 		limit = 200
+ 	}
+ 
++	rootAbs, err := filepath.Abs(localMusicDownloadDir())
++	if err != nil {
++		return nil
++	}
+ 	like := "%" + keyword + "%"
+ 	var rows []LocalMusicIndex
+-	if err := db.Where("name LIKE ? OR artist LIKE ? OR album LIKE ?", like, like, like).
++	if err := localMusicIndexForRoot(rootAbs).Where("(name LIKE ? OR artist LIKE ? OR album LIKE ?)", like, like, like).
+ 		Order("mod_time DESC").
+ 		Limit(limit).
+ 		Find(&rows).Error; err != nil {
+ 		return nil
+-	}
+-
+-	rootAbs, err := filepath.Abs(localMusicDownloadDir())
+-	if err != nil {
+-		rootAbs = ""
+ 	}
+ 
+ 	songs := make([]model.Song, 0, len(rows))
+--- a/internal/web/local_music.go
++++ b/internal/web/local_music.go
+@@ -424,7 +424,8 @@
+ 			AudioCnt int
+ 		}
+ 
+-		duplicateGroups := db.Model(&LocalMusicIndex{}).
++		rootAbs, _ := filepath.Abs(localMusicDownloadDir())
++		duplicateGroups := localMusicIndexForRoot(rootAbs).Model(&LocalMusicIndex{}).
+ 			Select("name, artist").
+ 			Group("name, artist").
+ 			Having("COUNT(*) > 1")
+@@ -442,7 +443,7 @@
+ 		}
+ 
+ 		var rows []dupRow
+-		if err := db.Model(&LocalMusicIndex{}).
++		if err := localMusicIndexForRoot(rootAbs).Model(&LocalMusicIndex{}).
+ 			Select("name, artist, COUNT(*) as count, MAX(size) as max_size, MAX(CAST(duration AS INTEGER)) as max_br, COUNT(*) as audio_cnt").
+ 			Group("name, artist").
+ 			Having("COUNT(*) > 1").
+@@ -457,11 +458,10 @@
+ 		groups := make([]dupGroup, 0, len(rows))
+ 		for _, row := range rows {
+ 			var songs []LocalMusicIndex
+-			db.Where("name = ? AND artist = ?", row.Name, row.Artist).
++			localMusicIndexForRoot(rootAbs).Where("name = ? AND artist = ?", row.Name, row.Artist).
+ 				Order("size DESC").
+ 				Find(&songs)
+ 
+-			rootAbs, _ := filepath.Abs(localMusicDownloadDir())
+ 			items := make([]localMusicDupItem, 0, len(songs))
+ 			for _, s := range songs {
+ 				absPath := filepath.Join(rootAbs, filepath.FromSlash(s.RelPath))

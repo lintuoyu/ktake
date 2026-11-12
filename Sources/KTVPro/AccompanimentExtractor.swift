@@ -5,7 +5,7 @@ import Foundation
 enum AccompanimentExtractor {
     struct Progress: Decodable, Equatable, Sendable {
         enum Phase: String, Decodable, Sendable {
-            case preparingModel, loadingModel, separating, saving
+            case downloadingModel, preparingModel, loadingModel, separating, saving
         }
 
         let phase: Phase
@@ -20,6 +20,11 @@ enum AccompanimentExtractor {
         }
     }
 
+    struct ModelLocation: Sendable {
+        let destination: URL
+        let installed: URL?
+    }
+
     enum Model: String {
         case highQuality = "Kim Vocal 2"
         case instHQ3 = "Inst HQ 3"
@@ -31,6 +36,22 @@ enum AccompanimentExtractor {
             #else
             return false
             #endif
+        }
+
+        var downloadSize: String {
+            switch self {
+            case .highQuality: "约 456 MB"
+            case .instHQ3: "约 67 MB"
+            case .smallKaraoke: "约 202 MB"
+            }
+        }
+
+        var weightsSize: Int {
+            switch self {
+            case .highQuality: 456_483_463
+            case .instHQ3: 66_871_394
+            case .smallKaraoke: 202_371_435
+            }
         }
 
         var runtimeName: String {
@@ -59,13 +80,75 @@ enum AccompanimentExtractor {
         }
     }
 
-    static func extract(source: URL, destination: URL, engineDirectory: URL, model: Model,
+    static func modelLocation(for model: Model, engineDirectory: URL, modelDirectory: URL?) throws -> ModelLocation {
+        let cache = model.scriptSettings.cache
+        let modelRoot = try modelDirectory.map { try StorageLocations.existingDirectory($0) }
+        let destination = (modelRoot?.appendingPathComponent("KTake Models/v1", isDirectory: true) ?? engineDirectory)
+            .appendingPathComponent(cache, isDirectory: true)
+        let originalCache = (modelRoot ?? engineDirectory).appendingPathComponent(cache, isDirectory: true)
+        var candidates = [destination, originalCache]
+        if let modelRoot { candidates.append(modelRoot) }
+        if model == .highQuality {
+            let snapshot = "models--mlx-community--mel-roformer-kim-vocal-2-mlx/snapshots/64cbfcb004e39430e5f584552c05949440ec39ce"
+            candidates.append(originalCache.appendingPathComponent(snapshot, isDirectory: true))
+        }
+        return ModelLocation(destination: destination, installed: candidates.first { modelIsReady(model, in: $0) })
+    }
+
+    private static func modelIsReady(_ model: Model, in directory: URL) -> Bool {
+        let weights = directory.appendingPathComponent("model.safetensors").resolvingSymlinksInPath()
+        guard let attributes = try? weights.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              attributes.isRegularFile == true, attributes.fileSize == model.weightsSize else { return false }
+        if model == .smallKaraoke { return true }
+        let config = directory.appendingPathComponent("config.json")
+        return FileManager.default.isReadableFile(atPath: config.path)
+            && ((try? config.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0
+    }
+
+    static func downloadModel(_ model: Model, to destination: URL, engineDirectory: URL,
+                              status: @escaping @Sendable (String) -> Void) async throws {
+        let work = Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            if modelIsReady(model, in: destination) { return }
+            let files = FileManager.default
+            let parent = destination.deletingLastPathComponent()
+            try files.createDirectory(at: parent, withIntermediateDirectories: true)
+            let staging = parent.appendingPathComponent(".model-\(UUID().uuidString)", isDirectory: true)
+            try files.createDirectory(at: staging, withIntermediateDirectories: false)
+            defer { try? files.removeItem(at: staging) }
+            let weights = staging.appendingPathComponent("weights", isDirectory: true)
+            let executable = try await runtime(for: model, in: engineDirectory, staging: staging, status: status)
+            let script = try modelScript(model)
+            status("正在下载「\(model.rawValue)」模型…")
+            try await run(executable, ["-E", "-s", "-B", script.path, "--download", weights.path],
+                          in: staging, errorTitle: "无法下载「\(model.rawValue)」模型")
+            try Task.checkCancellation()
+            guard modelIsReady(model, in: weights) else { throw AppFailure(message: "下载的模型文件不完整。") }
+            if modelIsReady(model, in: destination) { return }
+            do {
+                if files.fileExists(atPath: destination.path) {
+                    _ = try files.replaceItemAt(destination, withItemAt: weights)
+                } else {
+                    try files.moveItem(at: weights, to: destination)
+                }
+            } catch {
+                guard modelIsReady(model, in: destination) else { throw error }
+            }
+        }
+        try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+    }
+
+    static func extract(source: URL, destination: URL, engineDirectory: URL, model: Model, weights: URL,
                         progress: @escaping @MainActor @Sendable (Progress) -> Void = { _ in },
                         status: @escaping @Sendable (String) -> Void) async throws {
         let work = Task.detached(priority: .utility) {
             guard model.isSupported else {
                 throw AppFailure(message: "此模型需要搭载 Apple 芯片的 Mac。")
             }
+            guard modelIsReady(model, in: weights) else {
+                throw AppFailure(message: "找不到完整的「\(model.rawValue)」模型，请重新连接模型目录或下载。")
+            }
+            try StorageLocations.requireDataDirectory(for: destination)
             let files = FileManager.default
             let parent = destination.deletingLastPathComponent()
             try files.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -80,31 +163,11 @@ enum AccompanimentExtractor {
             try WAVRenderer.write(asset: song.asset, tracks: tracks, to: input, sampleRate: 44_100, channels: 2,
                                   duration: song.duration)
 
-            let runtime = engineDirectory.appendingPathComponent(model.runtimeName, isDirectory: true)
-            let settings = model.scriptSettings
-            let executable = runtime.appendingPathComponent("bin/python")
-            let marker = runtime.appendingPathComponent(settings.readyMarker)
-            if !files.isExecutableFile(atPath: executable.path) || !files.fileExists(atPath: marker.path) {
-                status("首次使用，正在安装本地分离引擎…")
-                guard let uv = findUV() else {
-                    throw AppFailure(message: "首次提取需要 uv。请先安装 uv（brew install uv），再重试。")
-                }
-                try files.createDirectory(at: engineDirectory, withIntermediateDirectories: true)
-                try await run(uv, ["venv", "--allow-existing", "--python", "3.12", runtime.path],
-                              in: staging, errorTitle: "无法准备本地 Python")
-                try await run(uv, ["pip", "install", "--python", runtime.appendingPathComponent("bin/python").path,
-                                   "--index-url", "https://pypi.org/simple"] + model.packages,
-                              in: staging, errorTitle: "无法安装本地分离引擎")
-                try Data().write(to: marker, options: .atomic)
-            }
-
-            guard let script = Bundle.main.url(forResource: settings.resource, withExtension: "py") else {
-                throw AppFailure(message: "应用缺少 \(model.rawValue) 分离组件。")
-            }
-            let models = engineDirectory.appendingPathComponent(settings.cache, isDirectory: true)
+            let script = try modelScript(model)
             let output = staging.appendingPathComponent("instrumental.wav")
             let progressFile = staging.appendingPathComponent("progress.json")
-            let arguments = ["-B", script.path, input.path, output.path, models.path, progressFile.path]
+            let arguments = ["-E", "-s", "-B", script.path, input.path, output.path, weights.path, progressFile.path]
+            let executable = try await runtime(for: model, in: engineDirectory, staging: staging, status: status)
             try await run(executable, arguments, in: staging, errorTitle: "\(model.rawValue) 未能完成提取",
                           progress: (file: progressFile, update: progress))
             let result = try AVAudioFile(forReading: output)
@@ -117,6 +180,42 @@ enum AccompanimentExtractor {
             try files.moveItem(at: output, to: destination)
         }
         try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+    }
+
+    private static func modelScript(_ model: Model) throws -> URL {
+        guard let script = Bundle.main.url(forResource: model.scriptSettings.resource, withExtension: "py") else {
+            throw AppFailure(message: "应用缺少 \(model.rawValue) 分离组件。")
+        }
+        return script
+    }
+
+    private static func runtime(for model: Model, in directory: URL, staging: URL,
+                                status: @Sendable (String) -> Void) async throws -> URL {
+        let files = FileManager.default
+        if Bundle.main.object(forInfoDictionaryKey: "KTakeBundledSeparation") as? Bool == true,
+           let resources = Bundle.main.resourceURL {
+            let executable = resources.appendingPathComponent("SeparationRuntime/bin/python3.12")
+            guard files.isExecutableFile(atPath: executable.path) else {
+                throw AppFailure(message: "安装包内的分离引擎不完整，请重新安装 KTake。")
+            }
+            return executable
+        }
+        let runtime = directory.appendingPathComponent(model.runtimeName, isDirectory: true)
+        let executable = runtime.appendingPathComponent("bin/python")
+        let marker = runtime.appendingPathComponent(model.scriptSettings.readyMarker)
+        if files.isExecutableFile(atPath: executable.path), files.fileExists(atPath: marker.path) { return executable }
+        status("首次使用，正在安装本地分离引擎…")
+        guard let uv = findUV() else {
+            throw AppFailure(message: "此模型的首次提取需要 uv。请先安装 uv（brew install uv），再重试。")
+        }
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        try await run(uv, ["venv", "--allow-existing", "--python", "3.12", runtime.path],
+                      in: staging, errorTitle: "无法准备本地 Python")
+        try await run(uv, ["pip", "install", "--python", executable.path,
+                           "--index-url", "https://pypi.org/simple"] + model.packages,
+                      in: staging, errorTitle: "无法安装本地分离引擎")
+        try Data().write(to: marker, options: .atomic)
+        return executable
     }
 
     private static func findUV() -> URL? {
@@ -140,7 +239,7 @@ enum AccompanimentExtractor {
         process.currentDirectoryURL = folder
         process.standardOutput = handle
         process.standardError = handle
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("DYLD_") }
         environment["HF_HUB_DISABLE_TELEMETRY"] = "1"
         environment["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
         environment["HF_HUB_DISABLE_XET"] = "1"

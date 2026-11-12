@@ -7,10 +7,13 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
     @Published private(set) var pageError: String?
     @Published private(set) var status = "试听确认后可点「加入曲库」。已下载的音频会直接复用。"
     @Published private(set) var adding = false
+    @Published private(set) var starting = false
 
     private let importer: MusicDLImporter
     private let onAdded: (LibrarySong) -> Void
     private var addTask: Task<Void, Never>?
+    private var loadTask: Task<Void, Never>?
+    private var serviceURL: URL?
 
     init(importer: MusicDLImporter, onAdded: @escaping (LibrarySong) -> Void) {
         self.importer = importer
@@ -30,11 +33,25 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
     }()
 
     func load() {
+        loadTask?.cancel()
         pageError = nil
-        webView.load(URLRequest(url: MusicDLImporter.baseURL.appendingPathComponent("", isDirectory: true), timeoutInterval: 30))
+        starting = true
+        loadTask = Task {
+            do {
+                let url = try await importer.serviceURL()
+                guard !Task.isCancelled else { return }
+                serviceURL = url
+                webView.load(URLRequest(url: url, timeoutInterval: 30))
+            } catch {
+                guard !Task.isCancelled else { return }
+                pageError = error.localizedDescription
+            }
+            starting = false
+        }
     }
 
     func close() {
+        loadTask?.cancel()
         addTask?.cancel()
         webView.stopLoading()
         webView.loadHTMLString("", baseURL: nil)
@@ -62,8 +79,8 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
         }
     }
 
-    private static func isServicePage(_ url: URL) -> Bool {
-        let service = MusicDLImporter.baseURL
+    private func isServicePage(_ url: URL) -> Bool {
+        guard let service = serviceURL else { return false }
         return url.scheme == service.scheme && url.host == service.host && url.port == service.port &&
             (url.path == service.path || url.path.hasPrefix(service.path + "/"))
     }
@@ -73,7 +90,7 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
         guard let url = action.request.url else { decisionHandler(.cancel); return }
         if url.scheme == "about" || action.targetFrame?.isMainFrame == false {
             decisionHandler(.allow)
-        } else if Self.isServicePage(url) {
+        } else if isServicePage(url) {
             if action.targetFrame == nil {
                 decisionHandler(.cancel)
                 if action.navigationType == .linkActivated { webView.load(action.request) }
@@ -88,7 +105,7 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         if (error as NSError).code != NSURLErrorCancelled {
-            pageError = "无法打开本机 music-dl。请确认 OrbStack 中的 go-music-dl 已启动，然后点「重新加载」。"
+            pageError = "无法打开内置 music-dl。请点「重新加载」重试。"
         }
     }
 
@@ -97,10 +114,10 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
         init(browser: MusicDLBrowser) { self.browser = browser }
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.frameInfo.isMainFrame, let page = message.frameInfo.request.url,
-                  MusicDLBrowser.isServicePage(page), let fields = message.body as? [String: String],
+            guard let browser, message.frameInfo.isMainFrame, let page = message.frameInfo.request.url,
+                  browser.isServicePage(page), let fields = message.body as? [String: String],
                   let track = MusicDLTrack(fields: fields) else { return }
-            browser?.importTrack(track)
+            browser.importTrack(track)
         }
     }
 
@@ -108,6 +125,9 @@ private final class MusicDLBrowser: NSObject, ObservableObject, WKNavigationDele
     // Add one KTake action while leaving filtering and playback to the page.
     private static let addImportButtons = """
     (() => {
+        const style = document.createElement('style');
+        style.textContent = '.cookie-item:has(#setting-download-dir), .cookie-item:has([id^="setting-vg-"]), [onclick="openAboutAppModal()"] { display: none !important; }';
+        document.head.append(style);
         const addButtons = () => {
             for (const card of document.querySelectorAll('.song-card[data-id][data-source]')) {
                 const actions = card.querySelector('.actions');
@@ -143,7 +163,7 @@ struct MusicDLSearchSheet: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var browser: MusicDLBrowser
 
-    init(importer: MusicDLImporter = MusicDLImporter(), onAdded: @escaping (LibrarySong) -> Void) {
+    init(importer: MusicDLImporter, onAdded: @escaping (LibrarySong) -> Void) {
         _browser = StateObject(wrappedValue: MusicDLBrowser(importer: importer, onAdded: onAdded))
     }
 
@@ -160,6 +180,8 @@ struct MusicDLSearchSheet: View {
                 MusicDLWebView(webView: browser.webView)
                 if let error = browser.pageError {
                     Text(error).font(.callout).padding(18).background(StudioTheme.chrome, in: RoundedRectangle(cornerRadius: 10))
+                } else if browser.starting {
+                    ProgressView("正在启动 music-dl…")
                 }
             }
             Divider()

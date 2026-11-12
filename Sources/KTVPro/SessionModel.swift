@@ -45,6 +45,13 @@ enum LibraryAudioVersion: String, Codable, CaseIterable {
     }
 }
 
+struct ModelDownloadRequest {
+    let song: LibrarySong
+    let version: LibraryAudioVersion
+    let model: AccompanimentExtractor.Model
+    let directory: URL
+}
+
 private struct SongPracticeSettings: Codable, Equatable {
     let semitones: Int
     let lyricDelay: Double
@@ -141,6 +148,7 @@ final class SessionModel: ObservableObject {
     @Published private(set) var extractedAccompaniments: [String: [LibraryAudioVersion: URL]] = [:]
     @Published private(set) var separatingSongID: String?
     @Published private(set) var accompanimentProgress: AccompanimentExtractor.Progress?
+    @Published var modelDownloadRequest: ModelDownloadRequest?
     private(set) var separatingModel: AccompanimentExtractor.Model?
     @Published private(set) var pendingAudioVersion: LibraryAudioVersion?
     private var separationTask: Task<Void, Never>?
@@ -149,7 +157,8 @@ final class SessionModel: ObservableObject {
     private let libraryRoot: URL?
     private var songLibraries: [String: SongLibrary] = [:]
     private let userLibraryRoot: URL?
-    private let musicDLImporter: MusicDLImporter?
+    let musicDLImporter: MusicDLImporter?
+    @Published private(set) var musicDLDownloadDirectory: URL?
     private let takesDirectory: URL
     private let moveToTrash: (URL) throws -> URL
     private let monitorDefaults: UserDefaults
@@ -222,6 +231,7 @@ final class SessionModel: ObservableObject {
         self.libraryRoot = libraryRoot
         self.userLibraryRoot = userLibraryRoot
         self.musicDLImporter = musicDLImporter ?? userLibraryRoot.map { MusicDLImporter(libraryRoot: $0) }
+        self.musicDLDownloadDirectory = self.musicDLImporter?.downloadLocation.customDirectory
         self.takesDirectory = takesDirectory
         self.moveToTrash = moveToTrash
         self.monitorDefaults = monitorDefaults
@@ -285,6 +295,11 @@ final class SessionModel: ObservableObject {
             Task { @MainActor in self?.tick() }
         }
         refreshLibrary(autoSelect: true)
+    }
+
+    func setMusicDLDownloadDirectory(_ url: URL?) async throws {
+        guard let musicDLImporter else { return }
+        musicDLDownloadDirectory = try await musicDLImporter.setDownloadDirectory(url)
     }
 
     func refreshLibrary(autoSelect: Bool = false) {
@@ -542,7 +557,7 @@ final class SessionModel: ObservableObject {
         }
     }
 
-    func extractAccompaniment(for song: LibrarySong, version: LibraryAudioVersion) {
+    func extractAccompaniment(for song: LibrarySong, version: LibraryAudioVersion, approvedModelDirectory: URL? = nil) {
         guard let model = version.extractionModel, model.isSupported, !busy, !loadingMedia, separatingSongID == nil,
               extractedAccompaniments[song.id]?[version] == nil, let library = songLibraries[song.id],
               let destination = extractedDestination(for: song, version: version),
@@ -553,6 +568,18 @@ final class SessionModel: ObservableObject {
             return
         }
         let engineDirectory = userLibraryRoot.deletingLastPathComponent().appendingPathComponent("Separation", isDirectory: true)
+        let location: AccompanimentExtractor.ModelLocation
+        do {
+            location = try AccompanimentExtractor.modelLocation(for: model, engineDirectory: engineDirectory,
+                                                               modelDirectory: StorageLocations.modelRoot)
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
+        if location.installed == nil && approvedModelDirectory != location.destination {
+            modelDownloadRequest = ModelDownloadRequest(song: song, version: version, model: model, directory: location.destination)
+            return
+        }
         let startingVersion = libraryAudioVersion(for: song.id)
         let generation = UUID()
         separationGeneration = generation
@@ -569,12 +596,18 @@ final class SessionModel: ObservableObject {
                 self.separationTask = nil
             }
             do {
+                if location.installed == nil {
+                    self.accompanimentProgress = .init(phase: .downloadingModel, completed: nil, total: nil, remainingSeconds: nil)
+                    try await AccompanimentExtractor.downloadModel(model, to: location.destination, engineDirectory: engineDirectory) { _ in }
+                    self.accompanimentProgress = nil
+                }
                 let source: URL
                 if let available { source = available }
                 else if let importer = self.musicDLImporter { source = try await importer.prepareAudio(for: song, library: library) }
                 else { throw AppFailure(message: "找不到曲目的原音频。") }
                 try await AccompanimentExtractor.extract(source: source, destination: destination,
                                                          engineDirectory: engineDirectory, model: model,
+                                                         weights: location.installed ?? location.destination,
                                                          progress: { [weak self] progress in
                     guard let self, self.separationGeneration == generation,
                           self.separationTask?.isCancelled == false else { return }
@@ -1162,6 +1195,7 @@ final class SessionModel: ObservableObject {
             return
         }
         do {
+            try StorageLocations.requireDataDirectory(for: takesDirectory)
             try FileManager.default.createDirectory(at: takesDirectory, withIntermediateDirectories: true)
             let id = UUID()
             let stamp = DateFormatter()
@@ -1572,14 +1606,20 @@ final class SessionModel: ObservableObject {
         stopTakePlayback()
         timer?.invalidate()
         if isTestingMic { stopMicTest() }
-        if isRecording { stopRecording { [weak self] in self?.audio.stop(); completion() } }
+        let finish: () -> Void = { [musicDLImporter] in
+            Task {
+                await musicDLImporter?.stopService()
+                completion()
+            }
+        }
+        if isRecording { stopRecording { [weak self] in self?.audio.stop(); finish() } }
         else if isFinalizing || isFinishingMicTest {
             // Termination is deferred until the outstanding WAV close has completed.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.prepareToQuit(completion) }
         } else {
             audio.stop()
             if let test = micTestResult { try? FileManager.default.removeItem(at: test.url.deletingLastPathComponent()) }
-            completion()
+            finish()
         }
     }
 }

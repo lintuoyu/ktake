@@ -9,8 +9,9 @@ enum LibraryImporter {
         let library = try SongLibrary(root: root)
         return library.songs.first { song in
             if let saved = song.musicDL {
-                return (saved.id == reference.id && saved.source == reference.source)
-                    || (saved.localPath != nil && saved.localPath == reference.localPath)
+                let sameDirectory = saved.localDirectory == reference.localDirectory
+                return (saved.id == reference.id && saved.source == reference.source && (!saved.isLocal || sameDirectory))
+                    || (sameDirectory && saved.localPath != nil && saved.localPath == reference.localPath)
             }
             // Previous versions kept a playable copy but did not store the provider track ID.
             guard song.sourceURL == origin.absoluteString, (try? library.url(song.accompaniment)) != nil else { return false }
@@ -29,6 +30,7 @@ enum LibraryImporter {
         let id = "musicdl-" + UUID().uuidString.lowercased()
         let path = "Songs/\(id)"
         let folder = root.appendingPathComponent(path, isDirectory: true)
+        try StorageLocations.requireDataDirectory(for: folder)
         try files.createDirectory(at: folder, withIntermediateDirectories: true)
         do {
             let lyricPath = attachment.map { _ in path + "/Lyrics.lrc" }
@@ -66,6 +68,7 @@ enum LibraryImporter {
             ? try SongLibrary(root: root).songs : []
         let id = "download-" + UUID().uuidString.lowercased()
         let folder = root.appendingPathComponent("Songs/\(id)", isDirectory: true)
+        try StorageLocations.requireDataDirectory(for: folder)
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let ext = file.pathExtension.lowercased()
         let safeExtension = !ext.isEmpty && ext.count <= 5 && ext.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) ? ext : "audio"

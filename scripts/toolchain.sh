@@ -1,7 +1,7 @@
 # Sourced by the build and test scripts (zsh).
 mkdir -p .build/clang-cache
 typeset -a compiler_flags
-compiler_flags=(-swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos14.0" -module-cache-path "$PWD/.build/clang-cache")
+compiler_flags=(-swift-version 5 -parse-as-library -target "${KTAKE_TARGET_ARCH:-$(uname -m)}-apple-macos14.0" -module-cache-path "$PWD/.build/clang-cache")
 toolchain_include="$(xcode-select -p)/usr/include/swift"
 if [[ -f "$toolchain_include/module.modulemap" && -f "$toolchain_include/bridging.modulemap" ]] \
     && /usr/bin/grep -q 'module SwiftBridging' "$toolchain_include/module.modulemap" \

@@ -6,8 +6,8 @@
     <key>CFBundleName</key><string>KTake</string>
     <key>CFBundleDisplayName</key><string>KTake</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.10.11</string>
-    <key>CFBundleVersion</key><string>33</string>
+    <key>CFBundleShortVersionString</key><string>0.10.14</string>
+    <key>CFBundleVersion</key><string>36</string>
     <key>NSAppTransportSecurity</key><dict>
         <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
         <key>NSAllowsLocalNetworking</key><true/>
