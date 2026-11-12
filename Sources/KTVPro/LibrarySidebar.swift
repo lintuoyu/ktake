@@ -6,6 +6,7 @@ struct LibrarySidebar: View {
     let accent: Color
     let reviewTake: (Take) -> Void
     let openFiveSing: () -> Void
+    let openMusicDL: () -> Void
     @State private var section: Section = .songs
     @State private var songQuery = ""
     @State private var takeQuery = ""
@@ -58,7 +59,7 @@ struct LibrarySidebar: View {
     private var controls: some View {
         VStack(spacing: 12) {
             Picker("资料库", selection: $section) {
-                Text("本地曲库").tag(Section.songs)
+                Text("曲库").tag(Section.songs)
                 Text("我的录音").tag(Section.takes)
             }.pickerStyle(.segmented).labelsHidden()
 
@@ -151,19 +152,26 @@ struct LibrarySidebar: View {
 
     private func songRow(_ song: LibrarySong) -> some View {
         let selected = model.selectedSongID == song.id
+        let version = model.libraryAudioVersion(for: song.id)
         return HStack(spacing: 2) {
             Button {
                 if !selected { model.selectSong(song.id) }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: selected ? "waveform" : "music.note")
+                    Image(systemName: selected ? "waveform" : song.musicDL != nil ? "music.note.list" : "music.note")
                         .font(.system(size: 12)).foregroundStyle(selected ? accent : .secondary).frame(width: 18)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(song.title).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1)
                         Text(song.artist).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer(minLength: 4)
-                    if let seconds = song.duration { durationLabel(seconds) }
+                    if model.separatingSongID == song.id {
+                        ProgressView().controlSize(.small).accessibilityLabel("正在提取伴奏")
+                    } else if version != .original {
+                        Image(systemName: "waveform.badge.minus")
+                            .font(.system(size: 11)).foregroundStyle(accent)
+                            .accessibilityLabel(version.label).help("正在使用\(version.label)")
+                    } else if let seconds = song.duration { durationLabel(seconds) }
                 }
                 .padding(.leading, 9).frame(height: 52).contentShape(Rectangle())
             }.buttonStyle(.plain).disabled(libraryLocked)
@@ -171,11 +179,31 @@ struct LibrarySidebar: View {
                 .accessibilityAddTraits(selected ? .isSelected : [])
                 .help(song.displayName)
             Menu {
+                if model.separatingSongID == song.id {
+                    Button("取消提取伴奏", systemImage: "xmark.circle") { model.cancelAccompanimentExtraction() }
+                } else {
+                    let versions = model.extractedAccompaniments[song.id] ?? [:]
+                    if !versions.isEmpty {
+                        ForEach(model.availableAudioVersions(for: song.id), id: \.self) { option in
+                            Button("使用 \(option.label)", systemImage: version == option ? "checkmark" : "waveform") {
+                                model.setLibraryAudioVersion(for: song, version: option)
+                            }.disabled(libraryLocked)
+                        }
+                    }
+                    ForEach(LibraryAudioVersion.extracted.filter {
+                        versions[$0] == nil && $0.extractionModel?.isSupported == true
+                    }, id: \.self) { option in
+                        Button("提取 \(option.label)", systemImage: "waveform.badge.minus") {
+                            model.extractAccompaniment(for: song, version: option)
+                        }.disabled(libraryLocked || model.separatingSongID != nil)
+                    }
+                }
+                Divider()
                 Button("在 Finder 中显示", systemImage: "folder") { model.revealLibrarySong(song) }
                 Divider()
                 Button("移出曲库…", systemImage: "trash", role: .destructive) {
                     pendingRemoval = .song(song, moveFiles: model.canTrashLibrarySong(song))
-                }.disabled(libraryLocked)
+                }.disabled(libraryLocked || model.separatingSongID == song.id)
             } label: { rowMenuIcon }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             .accessibilityLabel("曲目操作：\(song.title)").help("曲目操作")
@@ -267,11 +295,13 @@ struct LibrarySidebar: View {
     }
 
     private var tools: some View {
-        HStack {
+        HStack(spacing: 7) {
             if section == .songs {
                 Button(action: openFiveSing) { Label("5sing 找伴奏", systemImage: "magnifyingglass") }
-                    .disabled(libraryLocked)
-                Spacer()
+                    .fixedSize().disabled(libraryLocked)
+                Button("music-dl 聚合搜索", action: openMusicDL)
+                    .fixedSize().disabled(libraryLocked)
+                Spacer(minLength: 0)
                 if !model.hiddenSongIDs.isEmpty {
                     Menu {
                         Button("恢复隐藏曲目（\(model.hiddenSongIDs.count)）") { model.restoreHiddenSongs() }

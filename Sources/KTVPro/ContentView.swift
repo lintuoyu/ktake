@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var lyricSearch: LyricSearchContext?
     @State private var takeReview: TakeReviewRequest?
     @State private var lyricNavigator = false
+    @State private var musicDLSearch = false
     @State private var requestedPunch: (Take, PracticeRange)?
     @StateObject private var fiveSing = FiveSingBrowser()
 
@@ -22,10 +23,14 @@ struct ContentView: View {
             header
             StudioTheme.separator.frame(height: 1)
             HStack(spacing: 0) {
-                LibrarySidebar(model: model, accent: accent, reviewTake: { takeReview = model.beginTakeReview($0) }) {
+                LibrarySidebar(model: model, accent: accent, reviewTake: { takeReview = model.beginTakeReview($0) }, openFiveSing: {
                     fiveSing.onAdded = { [weak model] song in model?.downloadedSongAdded(song) }
                     fiveSing.show()
-                }.frame(width: 288)
+                }, openMusicDL: {
+                    if model.isPlaying { model.togglePlayback() }
+                    model.stopTakePlayback()
+                    musicDLSearch = true
+                }).frame(width: 288)
                 StudioTheme.separator.frame(width: 1)
                 VStack(spacing: 0) {
                     mediaSources
@@ -61,6 +66,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $lyricNavigator) {
             lyricNavigationSheet
+        }
+        .sheet(isPresented: $musicDLSearch) {
+            MusicDLSearchSheet { [weak model] song in model?.musicDLSongAdded(song) }
         }
         .alert("需要处理", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             if model.permissionDenied {
@@ -316,6 +324,10 @@ struct ContentView: View {
                 }
             }
             Spacer(minLength: 4)
+            if let song = model.librarySong {
+                let versions = model.availableAudioVersions(for: song.id)
+                if versions.count > 1 { audioVersionMenu(song, versions: versions) }
+            }
             Menu {
                 Picker("录前准备", selection: $model.recordLeadIn) {
                     ForEach(RecordLeadIn.allCases) { Text($0.rawValue).tag($0) }
@@ -324,6 +336,23 @@ struct ContentView: View {
                 .disabled(model.isRecordArmed || model.isRecording || model.isFinalizing)
                 .fixedSize().help("选择直接录制、倒数或提前听伴奏")
         }.font(.system(size: 11)).controlSize(.small)
+    }
+
+    private func audioVersionMenu(_ song: LibrarySong, versions: [LibraryAudioVersion]) -> some View {
+        let current = model.libraryAudioVersion(for: song.id)
+        let pending = model.pendingAudioVersion
+        return Menu {
+            ForEach(versions, id: \.self) { version in
+                Button(version.label, systemImage: version == current ? "checkmark" : version == pending ? "clock" : "waveform") {
+                    model.setLibraryAudioVersion(for: song, version: version)
+                }
+            }
+        } label: {
+            Label(pending == nil ? "切换音轨" : "准备音轨…", systemImage: "waveform")
+        }
+        .fixedSize()
+        .disabled(model.busy || model.loadingMedia)
+        .help(model.busy ? "录音及补录期间使用已选音轨" : "当前：\(current.label) · 可在播放中切换")
     }
 
     private var lyricNavigationSheet: some View {
@@ -469,13 +498,44 @@ struct ContentView: View {
         HStack(spacing: 8) {
             Circle().fill(model.isRecording ? StudioTheme.live : model.microphoneEnabled ? accent : Color.gray)
                 .frame(width: 5, height: 5)
-            Text(model.status).lineLimit(1)
+            if let progress = model.accompanimentProgress, let name = model.separatingModel?.rawValue {
+                extractionStatus(progress, name: name)
+            } else {
+                Text(model.status).lineLimit(1)
+            }
             Spacer()
             if model.microphoneEnabled {
                 Text(model.audio.deviceDescription + "  ·  " + model.audio.bufferDescription)
                     .font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
             }
         }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 22).frame(height: 34)
+    }
+
+    private func extractionStatus(_ progress: AccompanimentExtractor.Progress, name: String) -> some View {
+        let message = switch progress.phase {
+        case .preparingModel: "\(name) · 正在准备模型…"
+        case .loadingModel: "\(name) · 正在加载模型…"
+        case .separating: "\(name) · 正在分离人声"
+        case .saving: "正在合成并保存伴奏…"
+        }
+        return HStack(spacing: 8) {
+            Text(message).lineLimit(1)
+            if let fraction = progress.fraction {
+                ProgressView(value: fraction)
+                    .controlSize(.small).frame(width: 100)
+                    .accessibilityLabel("伴奏提取进度")
+                Text("\(Int(fraction * 100))%").monospacedDigit()
+                if progress.phase == .separating {
+                    if let seconds = progress.remainingSeconds, seconds.isFinite, seconds > 0 {
+                        Text("预计剩余 \(timeLabel(ceil(seconds)))").monospacedDigit()
+                    } else {
+                        Text("正在估算剩余时间…")
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+        }
     }
 
     private func sectionLabel(_ text: String) -> some View {

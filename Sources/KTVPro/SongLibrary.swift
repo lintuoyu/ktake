@@ -1,5 +1,15 @@
 import Foundation
 
+struct MusicDLReference: Codable, Sendable {
+    let id: String
+    let source: String
+    let album: String
+    let identifiers: [String: String]
+    let localPath: String?
+
+    var isLocal: Bool { source == "local" || source == "local-file" }
+}
+
 struct LibrarySong: Identifiable, Codable {
     let id: String
     var title: String
@@ -11,6 +21,7 @@ struct LibrarySong: Identifiable, Codable {
     var sourceURL: String? = nil
     var lyricsSourceURL: String? = nil
     var lyricStatus: String? = nil
+    var musicDL: MusicDLReference? = nil
     var displayName: String { "\(artist) — \(title)" }
 }
 

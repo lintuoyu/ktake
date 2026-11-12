@@ -18,16 +18,52 @@ enum RecordLeadIn: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
+enum LibraryAudioVersion: String, Codable, CaseIterable {
+    case original, standard, highQuality, instHQ3, mdx23c, smallKaraoke
+
+    static let extracted: [Self] = allCases.filter { $0 != .original }
+
+    var label: String {
+        switch self {
+        case .original: "原唱 / 原音频"
+        case .standard: "标准伴奏"
+        case .highQuality: "Kim Vocal 2 伴奏"
+        case .instHQ3: "UVR Inst HQ 3 伴奏"
+        case .smallKaraoke: "Small Karaoke（去主唱、保留和声）"
+        case .mdx23c: "MDX23C-InstVoc HQ 伴奏"
+        }
+    }
+
+    var extractionModel: AccompanimentExtractor.Model? {
+        switch self {
+        // Retired models remain valid audio versions for existing selections and WAVs.
+        case .original, .standard, .mdx23c: nil
+        case .highQuality: .highQuality
+        case .instHQ3: .instHQ3
+        case .smallKaraoke: .smallKaraoke
+        }
+    }
+}
+
 private struct SongPracticeSettings: Codable, Equatable {
     let semitones: Int
     let lyricDelay: Double
     let position: Double
     let lyricsPath: String?
+    var usesExtractedAccompaniment: Bool? = nil
+    var audioVersion: LibraryAudioVersion? = nil
 }
 
 private struct SongPracticeFile: Codable {
     var songs: [String: SongPracticeSettings] = [:]
     var lastSongID: String?
+}
+
+private struct MonitorPreferences: Codable {
+    static let key = "monitorPreferences"
+
+    let preset: String
+    let effects: VocalSettings
 }
 
 struct MicTestResult {
@@ -47,6 +83,7 @@ struct MicTestResult {
 
 @MainActor
 final class SessionModel: ObservableObject {
+    private static let playbackTimescale: CMTimeScale = 48_000
     let player = AVPlayer()
     let audio = AudioEngine()
     private let takePlayer = TakePlayer()
@@ -57,12 +94,12 @@ final class SessionModel: ObservableObject {
     @Published var microphoneEnabled = false
     @Published var enablingMicrophone = false
     @Published var monitoring = false { didSet { updateEffects() } }
-    @Published var monitorGain: Float = 0.8 { didSet { updateEffects() } }
-    @Published var brightness: Float = 2 { didSet { updateEffects() } }
-    @Published var compression: Float = 0.35 { didSet { updateEffects() } }
-    @Published var reverb: Float = 18 { didSet { updateEffects() } }
+    @Published var monitorGain: Float = 0.8 { didSet { monitorParametersChanged() } }
+    @Published var brightness: Float = 2 { didSet { monitorParametersChanged() } }
+    @Published var compression: Float = 0.35 { didSet { monitorParametersChanged() } }
+    @Published var reverb: Float = 18 { didSet { monitorParametersChanged() } }
     @Published var videoVolume: Float = 0.65 { didSet { player.volume = videoVolume } }
-    @Published var preset = "自然人声"
+    @Published private(set) var preset = "自然人声"
     @Published var mediaURL: URL?
     @Published var accompanimentURL: URL?
     @Published var lyricsURL: URL?
@@ -101,11 +138,21 @@ final class SessionModel: ObservableObject {
     @Published private(set) var semitones = 0
     @Published private(set) var preparingPitch = false
     @Published private(set) var pitchProgress = 0.0
+    @Published private(set) var extractedAccompaniments: [String: [LibraryAudioVersion: URL]] = [:]
+    @Published private(set) var separatingSongID: String?
+    @Published private(set) var accompanimentProgress: AccompanimentExtractor.Progress?
+    private(set) var separatingModel: AccompanimentExtractor.Model?
+    @Published private(set) var pendingAudioVersion: LibraryAudioVersion?
+    private var separationTask: Task<Void, Never>?
+    private var separationGeneration: UUID?
+    private var audioVersionTask: Task<Void, Never>?
     private let libraryRoot: URL?
     private var songLibraries: [String: SongLibrary] = [:]
     private let userLibraryRoot: URL?
+    private let musicDLImporter: MusicDLImporter?
     private let takesDirectory: URL
     private let moveToTrash: (URL) throws -> URL
+    private let monitorDefaults: UserDefaults
     private let practiceSettingsURL: URL?
     private var practice = SongPracticeFile()
     private var lastPracticeWrite = Date.distantPast
@@ -136,7 +183,8 @@ final class SessionModel: ObservableObject {
     private var captureBusy: Bool { isRecording || isFinalizing || enablingMicrophone || isTestingMic || isFinishingMicTest || takeReviewActive }
     var busy: Bool { captureBusy || isRecordArmed || punchRange != nil }
     var canPressRecord: Bool {
-        isRecording || isRecordArmed || (microphoneEnabled && !captureBusy && !loadingMedia && (!hasSong || mediaReady))
+        isRecording || isRecordArmed || (microphoneEnabled && !captureBusy && separatingSongID == nil
+            && pendingAudioVersion == nil && !loadingMedia && (!hasSong || mediaReady))
     }
     var practiceRange: PracticeRange? {
         guard let loopA, let loopB else { return nil }
@@ -150,22 +198,43 @@ final class SessionModel: ObservableObject {
     var librarySong: LibrarySong? { songs.first { $0.id == selectedSongID } }
     var songTitle: String { librarySong?.displayName ?? (accompanimentURL ?? mediaURL)?.deletingPathExtension().lastPathComponent ?? "未选择歌曲" }
     var pitchLabel: String { semitones == 0 ? "原调" : String(format: "%+d 半音", semitones) }
-    var audioSourceLabel: String { accompanimentURL != nil ? "独立伴奏\(mediaURL != nil ? " · MV 原音已关闭" : " · 人声单独录制")" : mediaURL != nil ? "播放 MV 自带音轨" : "导入伴奏后即可跟唱" }
+    var audioSourceLabel: String {
+        if accompanimentURL != nil {
+            let source = selectedSongID.flatMap { id in
+                extractedAccompaniments[id].map { _ in libraryAudioVersion(for: id).label }
+            } ?? "独立伴奏"
+            return source + (mediaURL != nil ? " · MV 原音已关闭" : " · 人声单独录制")
+        }
+        return mediaURL != nil ? "播放 MV 自带音轨" : "导入伴奏后即可跟唱"
+    }
     var currentLyricIndex: Int? {
         // AVPlayer can report an exact seek one 48 kHz tick before the requested time.
-        lyrics.index(at: position - lyricDelay + 2.0 / 48_000)
+        lyrics.index(at: position - lyricDelay + 2.0 / Double(Self.playbackTimescale))
     }
     var showsVideo: Bool { mediaReady && mediaURL != nil && position < videoDuration }
     var hasSong: Bool { mediaURL != nil || accompanimentURL != nil }
     var canSearchLyrics: Bool { hasSong && !busy && !loadingMedia }
 
     init(libraryRoot: URL? = SongLibrary.bundledRoot, userLibraryRoot: URL? = SongLibrary.userRoot,
-         takesDirectory: URL = Take.directory, moveToTrash: @escaping (URL) throws -> URL = Take.moveToSystemTrash) {
+         takesDirectory: URL = Take.directory, musicDLImporter: MusicDLImporter? = nil,
+         monitorDefaults: UserDefaults = .standard,
+         moveToTrash: @escaping (URL) throws -> URL = Take.moveToSystemTrash) {
         self.libraryRoot = libraryRoot
         self.userLibraryRoot = userLibraryRoot
+        self.musicDLImporter = musicDLImporter ?? userLibraryRoot.map { MusicDLImporter(libraryRoot: $0) }
         self.takesDirectory = takesDirectory
         self.moveToTrash = moveToTrash
+        self.monitorDefaults = monitorDefaults
         practiceSettingsURL = userLibraryRoot?.appendingPathComponent("practice-settings.json")
+        if let data = monitorDefaults.data(forKey: MonitorPreferences.key),
+           let saved = try? JSONDecoder().decode(MonitorPreferences.self, from: data) {
+            let effects = saved.effects.bounded
+            preset = saved.preset
+            monitorGain = effects.gain
+            brightness = effects.brightness
+            compression = effects.compression
+            reverb = effects.reverb
+        }
         if let practiceSettingsURL, let data = try? Data(contentsOf: practiceSettingsURL) {
             practice = (try? JSONDecoder().decode(SongPracticeFile.self, from: data)) ?? SongPracticeFile()
         }
@@ -173,11 +242,12 @@ final class SessionModel: ObservableObject {
         takes = Take.loadAll(in: takesDirectory)
         refreshDevices()
         audio.configurationChanged = { [weak self] in self?.handleDeviceChange() }
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                guard !self.loadingMedia else { return }
-                self.position = time.seconds.isFinite ? time.seconds : 0
+                guard let self, self.mediaReady, !self.loadingMedia else { return }
+                // A callback queued before a track switch can carry the old item's timestamp.
+                let time = self.player.currentTime().seconds
+                if time.isFinite { self.position = time }
                 self.isPlaying = self.player.rate > 0
                 if self.isRecording, let punch = self.punchRange, self.position >= punch.end {
                     self.stopRecording()
@@ -231,17 +301,33 @@ final class SessionModel: ObservableObject {
                 let loaded = try SongLibrary(root: root)
                 for song in loaded.songs where libraries[song.id] == nil && !hidden.contains(song.id) {
                     // Keep the entry in its catalog so Finder's “Put Back” can restore a trashed track.
-                    guard (try? loaded.url(song.accompaniment)) != nil else { continue }
+                    guard song.musicDL != nil || (try? loaded.url(song.accompaniment)) != nil else { continue }
                     libraries[song.id] = loaded
                     loadedSongs.append(song)
                 }
             }
             songLibraries = libraries
+            extractedAccompaniments = loadedSongs.reduce(into: [:]) { tracks, song in
+                for version in LibraryAudioVersion.extracted {
+                    guard let destination = extractedDestination(for: song, version: version),
+                          let info = try? destination.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey]),
+                          info.isRegularFile == true, info.isSymbolicLink != true, (info.fileSize ?? 0) > 44 else { continue }
+                    tracks[song.id, default: [:]][version] = destination
+                }
+            }
             hiddenSongIDs = hidden
             songs = loadedSongs
-            if autoSelect, let first = songs.first {
+            if autoSelect {
                 let recent = songs.first(where: { $0.id == practice.lastSongID })
-                selectSong((recent ?? first).id)
+                let canOpenImmediately: (LibrarySong) -> Bool = { song in
+                    self.extractedAccompaniments[song.id]?[self.preferredAudioVersion(for: song.id)] != nil
+                        || self.availableLibraryAudio(for: song) != nil
+                }
+                if let recent, canOpenImmediately(recent) {
+                    selectSong(recent.id)
+                } else if let song = songs.first(where: canOpenImmediately) {
+                    selectSong(song.id)
+                }
             }
         } catch { errorMessage = "无法读取曲库：\(error.localizedDescription)" }
     }
@@ -263,7 +349,7 @@ final class SessionModel: ObservableObject {
     func canTrashLibrarySong(_ song: LibrarySong) -> Bool { managedSongFolder(song) != nil }
 
     func removeLibrarySong(_ id: String, moveFiles: Bool) {
-        guard !busy, !loadingMedia, let song = songs.first(where: { $0.id == id }) else { return }
+        guard !busy, !loadingMedia, separatingSongID != id, let song = songs.first(where: { $0.id == id }) else { return }
         do {
             if moveFiles {
                 guard let folder = managedSongFolder(song) else {
@@ -293,29 +379,243 @@ final class SessionModel: ObservableObject {
     }
 
     func revealLibrarySong(_ song: LibrarySong) {
-        guard let library = songLibraries[song.id], let url = try? library.url(song.accompaniment) else {
-            errorMessage = "找不到曲目的伴奏文件。"
+        let url = extractedAccompaniments[song.id]?[libraryAudioVersion(for: song.id)] ?? availableLibraryAudio(for: song)
+        guard let url else {
+            errorMessage = song.musicDL == nil ? "找不到曲目的伴奏文件。" : "这首歌暂无本地音频。请先在曲库中打开它。"
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    func selectSong(_ id: String) {
+    private func availableLibraryAudio(for song: LibrarySong) -> URL? {
+        guard let library = songLibraries[song.id] else { return nil }
+        if song.musicDL != nil { return musicDLImporter?.availableAudio(for: song, library: library) }
+        return try? library.url(song.accompaniment)
+    }
+
+    func selectSong(_ id: String, audioVersion: LibraryAudioVersion? = nil) {
         guard !busy, !loadingMedia, let library = songLibraries[id], let song = songs.first(where: { $0.id == id }) else { return }
+        if id == selectedSongID, let audioVersion {
+            setLibraryAudioVersion(for: song, version: audioVersion)
+            return
+        }
+        cancelAudioVersionSwitch()
+        let version = audioVersion ?? preferredAudioVersion(for: id)
+        if let audio = extractedAccompaniments[id]?[version] ?? availableLibraryAudio(for: song) {
+            openLibrarySong(song, in: library, audio: audio)
+            return
+        }
+        guard song.musicDL != nil, let musicDLImporter else {
+            errorMessage = "找不到曲目的伴奏文件。"
+            return
+        }
+        guard separatingSongID != id else { return }
+        if isPlaying { togglePlayback() }
+        loadingMedia = true
+        status = "正在准备「\(song.title)」的播放音频…"
+        loadTask?.cancel()
+        let generation = UUID()
+        loadingGeneration = generation
+        loadTask = Task {
+            do {
+                let audio = try await musicDLImporter.prepareAudio(for: song, library: library)
+                guard !Task.isCancelled, generation == loadingGeneration else { return }
+                loadingMedia = false
+                if selectedSongID == id {
+                    rebuildSong(videoURL: mediaURL, accompanimentURL: audio, preservePlayback: true)
+                } else {
+                    openLibrarySong(song, in: library, audio: audio)
+                }
+            } catch {
+                guard !Task.isCancelled, generation == loadingGeneration else { return }
+                loadingMedia = false
+                status = "未能打开「\(song.title)」。"
+                errorMessage = "无法打开曲目：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func openLibrarySong(_ song: LibrarySong, in library: SongLibrary, audio: URL) {
         do {
-            let accompaniment = try library.url(song.accompaniment)
             let video = try song.video.map { try library.url($0) }
-            let manualLyric = savedSearchLyricsURL(key: "song:\(id)")
+            let manualLyric = savedSearchLyricsURL(key: "song:\(song.id)")
                 .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
             let lyric = try manualLyric ?? song.lyrics.map { try library.url($0) }
-            changePracticeSong(to: song.id, videoURL: video, accompanimentURL: accompaniment, defaultLyrics: lyric)
+            changePracticeSong(to: song.id, videoURL: video, accompanimentURL: audio, defaultLyrics: lyric)
         } catch { errorMessage = "无法打开曲目：\(error.localizedDescription)" }
     }
+
+    private func extractedDestination(for song: LibrarySong, version: LibraryAudioVersion) -> URL? {
+        guard let userLibraryRoot else { return nil }
+        let filenames: (managed: String, separate: String)
+        switch version {
+        case .original: return nil
+        case .standard: filenames = ("KTake Instrumental.wav", "instrumental.wav")
+        case .highQuality: filenames = ("KTake Instrumental HQ.wav", "instrumental-hq.wav")
+        case .instHQ3: filenames = ("KTake Instrumental UVR.wav", "instrumental-uvr.wav")
+        case .smallKaraoke: filenames = ("KTake Small Karaoke.wav", "small-karaoke.wav")
+        case .mdx23c: filenames = ("KTake Instrumental MDX23C.wav", "instrumental-mdx23c.wav")
+        }
+        if let folder = managedSongFolder(song) {
+            return folder.appendingPathComponent(filenames.managed)
+        }
+        // Bundled songs live in the signed app and use separate writable storage.
+        let key = SHA256.hash(data: Data(song.id.utf8)).map { String(format: "%02x", $0) }.joined()
+        return userLibraryRoot.appendingPathComponent("ExtractedAccompaniments", isDirectory: true)
+            .appendingPathComponent(key, isDirectory: true)
+            .appendingPathComponent(filenames.separate)
+    }
+
+    private func preferredAudioVersion(for id: String) -> LibraryAudioVersion {
+        let saved = practice.songs["song:\(id)"]
+        let versions = extractedAccompaniments[id]
+        if let version = saved?.audioVersion {
+            if version == .original || versions?[version] != nil { return version }
+        } else if saved?.usesExtractedAccompaniment == false { return .original }
+        return LibraryAudioVersion.extracted.first { versions?[$0] != nil } ?? .original
+    }
+
+    func libraryAudioVersion(for id: String) -> LibraryAudioVersion {
+        if selectedSongID == id {
+            return extractedAccompaniments[id]?.first { $0.value == accompanimentURL }?.key ?? .original
+        }
+        return preferredAudioVersion(for: id)
+    }
+
+    func availableAudioVersions(for id: String) -> [LibraryAudioVersion] {
+        [.original] + LibraryAudioVersion.extracted.filter { extractedAccompaniments[id]?[$0] != nil }
+    }
+
+    private func cancelAudioVersionSwitch() {
+        audioVersionTask?.cancel()
+        audioVersionTask = nil
+        pendingAudioVersion = nil
+    }
+
+    func setLibraryAudioVersion(for song: LibrarySong, version: LibraryAudioVersion) {
+        guard !busy, !loadingMedia, let library = songLibraries[song.id],
+              version == .original || extractedAccompaniments[song.id]?[version] != nil else { return }
+        if selectedSongID != song.id {
+            selectSong(song.id, audioVersion: version)
+            return
+        }
+        if pendingAudioVersion == version { return }
+        cancelAudioVersionSwitch()
+        if libraryAudioVersion(for: song.id) == version { return }
+
+        let target = extractedAccompaniments[song.id]?[version] ?? availableLibraryAudio(for: song)
+        let video = mediaURL
+        let pitch = semitones
+        pendingAudioVersion = version
+        audioVersionTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if !Task.isCancelled { self.cancelAudioVersionSwitch() }
+            }
+            do {
+                let audio: URL
+                if let target { audio = target }
+                else if song.musicDL != nil, self.separatingSongID != song.id, let importer = self.musicDLImporter {
+                    audio = try await importer.prepareAudio(for: song, library: library)
+                } else {
+                    throw AppFailure(message: "原音频暂不可用。")
+                }
+                let prepared = try await self.prepareSong(videoURL: video, accompanimentURL: audio, semitones: pitch)
+                guard !Task.isCancelled, self.selectedSongID == song.id, !self.busy, !self.loadingMedia else { return }
+                let previous = self.installedSong
+                let previousPosition = self.player.currentTime().seconds
+                let wasPlaying = self.player.rate > 0
+                self.audioVersionTask = nil
+                self.pendingAudioVersion = nil
+                self.rebuildSong(videoURL: video, accompanimentURL: audio, preservePlayback: true, preparedSong: prepared,
+                                 onFailure: { [weak self] in
+                    guard let self, let previous else { return }
+                    self.rebuildSong(videoURL: previous.videoURL, accompanimentURL: previous.accompanimentURL,
+                                     restorePosition: previousPosition, preparedSong: previous, onReady: { [weak self] in
+                        if wasPlaying { self?.togglePlayback() }
+                    })
+                })
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.errorMessage = "无法切换音轨：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    func extractAccompaniment(for song: LibrarySong, version: LibraryAudioVersion) {
+        guard let model = version.extractionModel, model.isSupported, !busy, !loadingMedia, separatingSongID == nil,
+              extractedAccompaniments[song.id]?[version] == nil, let library = songLibraries[song.id],
+              let destination = extractedDestination(for: song, version: version),
+              let userLibraryRoot else { return }
+        let available = availableLibraryAudio(for: song)
+        guard available != nil || (song.musicDL != nil && musicDLImporter != nil) else {
+            errorMessage = "找不到曲目的原音频。"
+            return
+        }
+        let engineDirectory = userLibraryRoot.deletingLastPathComponent().appendingPathComponent("Separation", isDirectory: true)
+        let startingVersion = libraryAudioVersion(for: song.id)
+        let generation = UUID()
+        separationGeneration = generation
+        separatingModel = model
+        separatingSongID = song.id
+        status = "正在准备提取「\(song.title)」的伴奏…"
+        separationTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.accompanimentProgress = nil
+                self.separatingModel = nil
+                self.separatingSongID = nil
+                self.separationGeneration = nil
+                self.separationTask = nil
+            }
+            do {
+                let source: URL
+                if let available { source = available }
+                else if let importer = self.musicDLImporter { source = try await importer.prepareAudio(for: song, library: library) }
+                else { throw AppFailure(message: "找不到曲目的原音频。") }
+                try await AccompanimentExtractor.extract(source: source, destination: destination,
+                                                         engineDirectory: engineDirectory, model: model,
+                                                         progress: { [weak self] progress in
+                    guard let self, self.separationGeneration == generation,
+                          self.separationTask?.isCancelled == false else { return }
+                    self.accompanimentProgress = progress
+                }) { [weak self] message in
+                    Task { @MainActor in
+                        guard let self, self.separationGeneration == generation,
+                              self.separationTask?.isCancelled == false else { return }
+                        self.status = message
+                    }
+                }
+                self.extractedAccompaniments[song.id, default: [:]][version] = destination
+                self.status = "「\(song.title)」的\(version.label)已就绪。"
+                if !Task.isCancelled, self.selectedSongID == song.id, !self.isPlaying, self.pendingAudioVersion == nil,
+                   self.libraryAudioVersion(for: song.id) == startingVersion {
+                    self.setLibraryAudioVersion(for: song, version: version)
+                }
+            } catch is CancellationError {
+                self.status = "已取消提取伴奏。"
+            } catch {
+                self.status = "提取伴奏失败。"
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelAccompanimentExtraction() { separationTask?.cancel() }
 
     func downloadedSongAdded(_ song: LibrarySong) {
         guard !busy, !loadingMedia else { status = "已下载到曲库，录音结束后刷新曲库即可选择。"; return }
         refreshLibrary()
         selectSong(song.id)
+    }
+
+    func musicDLSongAdded(_ song: LibrarySong) {
+        guard !busy, !loadingMedia else { status = "已加入曲库，录音结束后刷新曲库即可选择。"; return }
+        do {
+            if hiddenSongIDs.contains(song.id) { try saveHiddenSongs(hiddenSongIDs.subtracting([song.id])) }
+            refreshLibrary()
+            status = "已加入曲库：\(song.displayName)"
+        } catch { errorMessage = "无法显示已加入的曲目：\(error.localizedDescription)" }
     }
 
     func setPitch(_ value: Int) {
@@ -334,8 +634,12 @@ final class SessionModel: ObservableObject {
               let key = practiceKey(songID: selectedSongID, videoURL: mediaURL, accompanimentURL: accompanimentURL) else { return }
         // Returning to a completed song should leave it ready to sing again.
         let resume = position.isFinite && position < duration - 0.15 ? max(0, position) : 0
+        let version = selectedSongID.flatMap { id in
+            extractedAccompaniments[id].map { _ in libraryAudioVersion(for: id) }
+        }
         let value = SongPracticeSettings(semitones: semitones, lyricDelay: lyricDelay,
-                                         position: resume, lyricsPath: lyricsURL?.path)
+                                         position: resume, lyricsPath: lyricsURL?.path,
+                                         audioVersion: version)
         lastPracticeWrite = Date()
         guard practice.songs[key] != value || practice.lastSongID != selectedSongID else { return }
         var updated = practice
@@ -447,9 +751,22 @@ final class SessionModel: ObservableObject {
                      brightness: brightness, compression: compression, space: reverb)
     }
 
+    private func monitorParametersChanged() {
+        updateEffects()
+        let preferences = MonitorPreferences(preset: preset, effects: monitorEffects)
+        if let data = try? JSONEncoder().encode(preferences) {
+            monitorDefaults.set(data, forKey: MonitorPreferences.key)
+        }
+    }
+
+    private var monitorEffects: VocalSettings {
+        VocalSettings(brightness: brightness, compression: compression, reverb: reverb, gain: monitorGain).bounded
+    }
+
     var vocalSettings: VocalSettings {
-        VocalSettings(brightness: brightness, compression: compression, reverb: reverb,
-                      gain: monitorGain, enabled: monitoring).bounded
+        var settings = monitorEffects
+        settings.enabled = monitoring
+        return settings
     }
 
     func importVideo() {
@@ -563,10 +880,22 @@ final class SessionModel: ObservableObject {
         lyrics = .empty; lyricsURL = nil; lyricDelay = 0
     }
 
+    private func prepareSong(videoURL: URL?, accompanimentURL: URL?, semitones: Int,
+                             progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws -> SongComposition {
+        var audioOverride: URL?
+        if let accompanimentURL {
+            audioOverride = try await PitchRenderer.prepare(source: accompanimentURL, semitones: semitones, progress: progress)
+        }
+        try Task.checkCancellation()
+        return try await SongComposition.build(videoURL: videoURL, accompanimentURL: accompanimentURL, audioOverrideURL: audioOverride)
+    }
+
     private func rebuildSong(videoURL: URL?, accompanimentURL: URL?, targetSemitones: Int? = nil,
                              preservePlayback: Bool = false, restorePosition: Double? = nil,
+                             preparedSong: SongComposition? = nil,
                              forPunch: Bool = false, onReady: (() -> Void)? = nil, onFailure: (() -> Void)? = nil) {
         guard !busy || (forPunch && !captureBusy && !isRecordArmed) else { return }
+        cancelAudioVersionSwitch()
         if let loopBoundary { player.removeTimeObserver(loopBoundary); self.loopBoundary = nil }
         loopingSeek = false
         if videoURL == nil && accompanimentURL == nil { clearPracticeLoop() }
@@ -592,21 +921,20 @@ final class SessionModel: ObservableObject {
             return
         }
         loadingMedia = true
-        preparingPitch = desiredPitch != 0
+        preparingPitch = desiredPitch != 0 && preparedSong == nil
         pitchProgress = 0
         loadTask = Task {
             do {
-                var override: URL?
-                if desiredPitch != 0, let accompanimentURL {
-                    override = try await PitchRenderer.prepare(source: accompanimentURL, semitones: desiredPitch) { [weak self] value in
+                let song: SongComposition
+                if let preparedSong { song = preparedSong }
+                else {
+                    song = try await prepareSong(videoURL: videoURL, accompanimentURL: accompanimentURL, semitones: desiredPitch) { [weak self] value in
                         Task { @MainActor in
                             guard let self, self.loadingGeneration == generation else { return }
                             self.pitchProgress = value
                         }
                     }
                 }
-                try Task.checkCancellation()
-                let song = try await SongComposition.build(videoURL: videoURL, accompanimentURL: accompanimentURL, audioOverrideURL: override)
                 guard !Task.isCancelled, generation == loadingGeneration else { return }
                 duration = song.duration
                 videoDuration = song.videoDuration
@@ -619,7 +947,8 @@ final class SessionModel: ObservableObject {
                     Task { @MainActor in
                         guard let self, self.loadingGeneration == generation, self.player.currentItem === item else { return }
                         if item.status == .readyToPlay {
-                            self.player.seek(to: CMTime(seconds: restoredPosition, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
+                            self.player.seek(to: CMTime(seconds: restoredPosition, preferredTimescale: Self.playbackTimescale),
+                                             toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
                                 Task { @MainActor in
                                     guard let self, self.loadingGeneration == generation else { return }
                                     self.preparingPitch = false
@@ -681,7 +1010,8 @@ final class SessionModel: ObservableObject {
 
     private func performSeek(to target: Double, completion: ((Bool) -> Void)? = nil) {
         position = target
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 48_000), toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+        player.seek(to: CMTime(seconds: target, preferredTimescale: Self.playbackTimescale),
+                    toleranceBefore: .zero, toleranceAfter: .zero) { finished in
             Task { @MainActor in completion?(finished) }
         }
     }
@@ -748,8 +1078,8 @@ final class SessionModel: ObservableObject {
     }
 
     func startRecording() {
-        guard microphoneEnabled, audio.isRunning, !captureBusy, !isRecordArmed else { return }
-        if loadingMedia || (hasSong && !mediaReady) { errorMessage = "请等待歌曲加载完成。"; return }
+        guard microphoneEnabled, audio.isRunning, !captureBusy, !isRecordArmed, separatingSongID == nil else { return }
+        if loadingMedia || pendingAudioVersion != nil || (hasSong && !mediaReady) { errorMessage = "请等待歌曲加载完成。"; return }
         let livePosition = player.currentTime().seconds
         let start = punchRange?.start ?? (mediaReady ? min(duration, max(0, player.rate > 0 && livePosition.isFinite ? livePosition : position)) : 0)
         if mediaReady, start >= duration - 0.1 {
@@ -1225,6 +1555,15 @@ final class SessionModel: ObservableObject {
     }
 
     func prepareToQuit(_ completion: @escaping () -> Void) {
+        cancelAudioVersionSwitch()
+        if let separationTask {
+            separationTask.cancel()
+            Task {
+                await separationTask.value
+                prepareToQuit(completion)
+            }
+            return
+        }
         cancelRecordPreparation()
         stopPracticeLoop()
         savePracticeSettings()

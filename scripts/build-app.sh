@@ -29,6 +29,11 @@ source scripts/toolchain.sh
 xcrun swiftc "${compiler_flags[@]}" -O -whole-module-optimization -module-name KTake \
     Sources/KTVPro/*.swift -o "$app/Contents/MacOS/KTake"
 cp scripts/Info.plist "$app/Contents/Info.plist"
+cp scripts/extract-roformer.py "$app/Contents/Resources/ExtractRoFormer.py"
+cp scripts/extract-inst-hq3.py "$app/Contents/Resources/ExtractInstHQ3.py"
+cp scripts/extract-small-karaoke.py "$app/Contents/Resources/ExtractSmallKaraoke.py"
+cp scripts/separation_model_files.py "$app/Contents/Resources/"
+cp scripts/separation_progress.py "$app/Contents/Resources/"
 if [[ -f Resources/AppIcon.icns ]]; then
     cp Resources/AppIcon.icns "$app/Contents/Resources/"
     plutil -insert CFBundleIconFile -string AppIcon.icns "$app/Contents/Info.plist"
