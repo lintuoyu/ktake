@@ -11,6 +11,7 @@ struct LibrarySidebar: View {
     @State private var songQuery = ""
     @State private var takeQuery = ""
     @State private var songOrder: SongOrder = .recent
+    @State private var songScrollID: String?
     @State private var visibleSongs: [LibrarySong] = []
     @State private var visibleTakes: [Take] = []
     @State private var pendingRemoval: Removal?
@@ -43,6 +44,13 @@ struct LibrarySidebar: View {
         }
         .background(StudioTheme.library)
         .onReceive(model.$songs) { updateSongs($0) }
+        .onReceive(model.didImportAccompaniment) { id in
+            section = .songs
+            if let song = model.songs.first(where: { $0.id == id }), !matches([song.title, song.artist], tokens: searchTokens(songQuery)) {
+                songQuery = ""
+            }
+            songScrollID = id
+        }
         .onReceive(model.$takes) { updateTakes($0) }
         .onChange(of: songQuery) { _, _ in updateSongs(model.songs) }
         .onChange(of: songOrder) { _, _ in updateSongs(model.songs) }
@@ -107,13 +115,14 @@ struct LibrarySidebar: View {
         Group {
             if visibleSongs.isEmpty {
                 emptyList(songQuery.isEmpty ? "曲库暂无歌曲" : "没有找到曲目",
-                          detail: songQuery.isEmpty ? "可以从 5sing 找伴奏。" : "试试歌名或歌手的部分文字。")
+                          detail: songQuery.isEmpty ? "可导入本地伴奏，也可以从 5sing 找伴奏。" : "试试歌名或歌手的部分文字。")
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
                         ForEach(visibleSongs) { song in songRow(song) }
-                    }.padding(.horizontal, 7).padding(.vertical, 7)
+                    }.scrollTargetLayout().padding(.horizontal, 7).padding(.vertical, 7)
                 }
+                .scrollPosition(id: $songScrollID, anchor: .center)
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }

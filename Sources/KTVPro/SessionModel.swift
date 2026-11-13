@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import UniformTypeIdentifiers
 import AppKit
+import Combine
 import CryptoKit
 
 struct LyricSearchContext: Identifiable {
@@ -185,6 +186,7 @@ final class SessionModel: ObservableObject {
     private var itemStatusObservation: NSKeyValueObservation?
     private var loadTask: Task<Void, Never>?
     private var loadingGeneration = UUID()
+    let didImportAccompaniment = PassthroughSubject<String, Never>()
     private var installedSong: SongComposition?
     private var takePlaybackRestoresMonitoring = false
     private var takeReviewActive = false
@@ -450,13 +452,15 @@ final class SessionModel: ObservableObject {
         }
     }
 
-    private func openLibrarySong(_ song: LibrarySong, in library: SongLibrary, audio: URL) {
+    private func openLibrarySong(_ song: LibrarySong, in library: SongLibrary, audio: URL, importedFrom file: URL? = nil) {
         do {
-            let video = try song.video.map { try library.url($0) }
+            let video = try song.video.map { try library.url($0) } ?? (file == nil ? nil : mediaURL)
             let manualLyric = savedSearchLyricsURL(key: "song:\(song.id)")
                 .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
             let lyric = try manualLyric ?? song.lyrics.map { try library.url($0) }
-            changePracticeSong(to: song.id, videoURL: video, accompanimentURL: audio, defaultLyrics: lyric)
+            let previousKey = file.flatMap { practiceKey(songID: nil, videoURL: nil, accompanimentURL: $0) }
+            changePracticeSong(to: song.id, videoURL: video, accompanimentURL: audio, defaultLyrics: lyric,
+                               keepUnassignedLyrics: file != nil && accompanimentURL == nil, fallbackPracticeKey: previousKey)
         } catch { errorMessage = "无法打开曲目：\(error.localizedDescription)" }
     }
 
@@ -686,10 +690,11 @@ final class SessionModel: ObservableObject {
     }
 
     private func changePracticeSong(to id: String?, videoURL: URL?, accompanimentURL: URL?,
-                                    defaultLyrics: URL? = nil, keepUnassignedLyrics: Bool = false) {
+                                    defaultLyrics: URL? = nil, keepUnassignedLyrics: Bool = false, fallbackPracticeKey: String? = nil) {
         savePracticeSettings()
         clearPracticeLoop()
         let saved = practiceKey(songID: id, videoURL: videoURL, accompanimentURL: accompanimentURL).flatMap { practice.songs[$0] }
+            ?? fallbackPracticeKey.flatMap { practice.songs[$0] }
         let previous = (selectedSongID, lyrics, lyricsURL, lyricDelay)
         selectedSongID = id
         let pitch = saved?.semitones ?? 0
@@ -829,8 +834,41 @@ final class SessionModel: ObservableObject {
     }
 
     func loadAccompaniment(_ url: URL) {
-        guard !busy else { return }
-        changePracticeSong(to: nil, videoURL: mediaURL, accompanimentURL: url, keepUnassignedLyrics: !hasSong || accompanimentURL == nil)
+        guard !busy, !loadingMedia else { return }
+        guard let userLibraryRoot else {
+            changePracticeSong(to: nil, videoURL: mediaURL, accompanimentURL: url, keepUnassignedLyrics: accompanimentURL == nil)
+            return
+        }
+        loadingMedia = true
+        status = "正在将伴奏加入曲库…"
+        loadTask?.cancel()
+        let generation = UUID()
+        loadingGeneration = generation
+        loadTask = Task { [weak self] in
+            do {
+                let song = try await LibraryImporter.addLocalAccompaniment(url, root: userLibraryRoot)
+                guard let self, !Task.isCancelled, self.loadingGeneration == generation else { return }
+                self.loadingMedia = false
+                guard !self.busy else { self.status = "伴奏已加入曲库，可在录音结束后刷新查看。"; return }
+                if self.hiddenSongIDs.contains(song.id) {
+                    try self.saveHiddenSongs(self.hiddenSongIDs.subtracting([song.id]))
+                }
+                self.refreshLibrary()
+                guard let library = self.songLibraries[song.id] else { return }
+                let audio = try library.url(song.accompaniment)
+                if self.selectedSongID == song.id, self.accompanimentURL == audio {
+                    self.status = "「\(song.title)」已在曲库中。"
+                } else {
+                    self.openLibrarySong(song, in: library, audio: audio, importedFrom: url)
+                }
+                self.didImportAccompaniment.send(song.id)
+            } catch {
+                guard let self, !Task.isCancelled, self.loadingGeneration == generation else { return }
+                self.loadingMedia = false
+                self.status = "伴奏导入失败。"
+                self.errorMessage = "无法导入伴奏：\(error.localizedDescription)"
+            }
+        }
     }
 
     func importLyrics() {
@@ -891,6 +929,7 @@ final class SessionModel: ObservableObject {
     }
 
     func loadDroppedFile(_ url: URL) {
+        guard !busy, !loadingMedia else { return }
         let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
         if url.pathExtension.lowercased() == "lrc" || type?.conforms(to: .plainText) == true { loadLyrics(url) }
         else if type?.conforms(to: .audio) == true { loadAccompaniment(url) }
@@ -1601,13 +1640,15 @@ final class SessionModel: ObservableObject {
         cancelRecordPreparation()
         stopPracticeLoop()
         savePracticeSettings()
-        loadTask?.cancel()
+        let pendingLoad = loadTask
+        pendingLoad?.cancel()
         player.pause()
         stopTakePlayback()
         timer?.invalidate()
         if isTestingMic { stopMicTest() }
         let finish: () -> Void = { [musicDLImporter] in
             Task {
+                await pendingLoad?.value
                 await musicDLImporter?.stopService()
                 completion()
             }

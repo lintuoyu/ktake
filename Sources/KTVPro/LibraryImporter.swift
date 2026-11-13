@@ -52,20 +52,41 @@ enum LibraryImporter {
         }
     }
 
+    static func addLocalAccompaniment(_ file: URL, root: URL) async throws -> LibrarySong {
+        let source = file.resolvingSymlinksInPath().standardizedFileURL
+        guard source.isFileURL, FileManager.default.isReadableFile(atPath: source.path),
+              (try? source.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            throw AppFailure(message: "找不到可读取的伴奏文件。")
+        }
+        let (title, artist) = await LyricMatcher.audioIdentity(file: source, title: "", artist: "")
+        try Task.checkCancellation()
+        return try add(file: source, title: title, artist: artist, sourceURL: source, root: root,
+                       markAsAccompaniment: false)
+    }
+
     /// Copies validated audio first; atomically publishes the catalog only after the copy succeeds.
     static func add(file: URL, title: String, artist: String, sourceURL: URL?, root: URL,
                     attachment: LyricAttachment? = nil, lyricStatus: String? = nil,
                     markAsAccompaniment: Bool = true) throws -> LibrarySong {
         let audio = try AVAudioFile(forReading: file)
         guard audio.length > 0, audio.processingFormat.sampleRate > 0 else {
-            throw AppFailure(message: "下载的文件不是可用的音频。")
+            throw AppFailure(message: "文件没有可用的音频。")
         }
         let seconds = Double(audio.length) / audio.processingFormat.sampleRate
         let fm = FileManager.default
         catalogLock.lock()
         defer { catalogLock.unlock() }
-        let existing = fm.fileExists(atPath: root.appendingPathComponent("catalog.json").path)
-            ? try SongLibrary(root: root).songs : []
+        let library = fm.fileExists(atPath: root.appendingPathComponent("catalog.json").path)
+            ? try SongLibrary(root: root) : nil
+        let existing = library?.songs ?? []
+        if let library, let sourceURL, sourceURL.isFileURL,
+           let duplicate = existing.first(where: { song in
+               guard song.sourceURL == sourceURL.absoluteString,
+                     let copy = try? library.url(song.accompaniment) else { return false }
+               return fm.contentsEqual(atPath: file.path, andPath: copy.path)
+           }) {
+            return duplicate
+        }
         let id = "download-" + UUID().uuidString.lowercased()
         let folder = root.appendingPathComponent("Songs/\(id)", isDirectory: true)
         try StorageLocations.requireDataDirectory(for: folder)
